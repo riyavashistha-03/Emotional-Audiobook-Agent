@@ -1,3 +1,9 @@
 pymupdf
-openai
 python-dotenv
+kokoro 
+soundfile
+groq
+huggingface_hub
+pydub
+numpy
+# --- IGNORE ---

@@ -1,0 +1,8 @@
+venv/
+model_assets/
+temp_audio/
+__pycache__/
+*.wav
+*.mp3
+.env
+*.pdf
