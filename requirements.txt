@@ -6,4 +6,7 @@ groq
 huggingface_hub
 pydub
 numpy
+streamlit
+librosa
+pyaudio
 # --- IGNORE ---
