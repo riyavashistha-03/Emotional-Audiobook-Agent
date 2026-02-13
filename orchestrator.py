@@ -1,419 +1,342 @@
+"""
+Main Orchestrator - Coordinates the entire audiobook generation process
+"""
 import os
 import json
-import fitz
+from pathlib import Path
+from typing import List, Dict, Optional, Callable
 from pydub import AudioSegment
-import re
-from main import StoryDirector
-from speaker import AudiobookSpeaker
+import time
 
-class ChapterBasedAudiobookAgent:
-    def __init__(self, pdf_path):
+from main import StoryDirector
+from character_analyst import CharacterVoiceDesigner
+from voice_manager import MOSSVoiceManager
+
+class AudiobookOrchestrator:
+    """
+    Master orchestrator that coordinates all components
+    """
+    
+    def __init__(self, 
+                 pdf_path: str,
+                 groq_api_key: str,
+                 moss_api_url: str = "http://localhost:7860",
+                 output_dir: str = "audiobook_output"):
+        
         self.pdf_path = pdf_path
-        self.output_folder = "chapters"
-        os.makedirs(self.output_folder, exist_ok=True)
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(exist_ok=True)
         
-        self.director = StoryDirector()
-        self.speaker = AudiobookSpeaker()
+        # Initialize components
+        print("🎧 Initializing Audiobook Orchestrator...")
+        self.director = StoryDirector(groq_api_key)
+        self.character_designer = CharacterVoiceDesigner(groq_api_key)
+        self.voice_manager = MOSSVoiceManager(moss_api_url)
         
-        # Load and process the entire book
-        print("📖 Loading and analyzing book structure...")
-        self.full_text = self.director.extract_text_from_pdf(pdf_path)
-        self.book_metadata = self.director.extract_book_metadata(self.full_text)
-        self.chapters = self.director.detect_chapters(self.full_text)
+        # State
+        self.full_text = ""
+        self.metadata = {}
+        self.chapters = []
+        self.character_registry = {}
+        self.voice_map = {}  # character -> voice_id
         
-        print(f"📚 Book: {self.book_metadata['title']}")
-        print(f"✍️ Author: {self.book_metadata['author']}")
-        print(f"📑 Found {len(self.chapters)} chapters")
-        
-        # Display chapter list for user
-        self.display_chapter_list()
+        # Progress tracking
+        self.progress_callback = None
+        self.status_callback = None
     
-    def display_chapter_list(self):
-        """Display all detected chapters with numbers"""
-        print("\n📋 Detected Chapters:")
-        print("-" * 60)
-        for i, chapter in enumerate(self.chapters):
-            # Truncate long titles
-            title = chapter['title'][:50] + "..." if len(chapter['title']) > 50 else chapter['title']
-            print(f"{i+1:3d}. {title}")
-        print("-" * 60)
+    def set_progress_callbacks(self, 
+                               progress_callback: Optional[Callable] = None,
+                               status_callback: Optional[Callable] = None):
+        """Set callbacks for UI progress updates"""
+        self.progress_callback = progress_callback
+        self.status_callback = status_callback
     
-    def create_book_introduction(self):
-        """Create introductory audio with book title and author"""
-        intro_text = f"{self.book_metadata['title']}. By {self.book_metadata['author']}."
-        
-        intro_notes = {
-            "character": "authoritative_narrator",
-            "emotion": "neutral",
-            "pace": "slow",
-            "voice_type": "authoritative"
-        }
-        
-        intro_file = os.path.join(self.output_folder, "00_introduction.wav")
-        print(f"\n🎤 Creating introduction: '{self.book_metadata['title']}'")
-        self.speaker.generate_audio(intro_text, intro_notes, intro_file)
-        
-        return AudioSegment.from_wav(intro_file)
+    def _update_progress(self, progress: float, status: str):
+        """Update progress via callbacks"""
+        if self.progress_callback:
+            self.progress_callback(progress)
+        if self.status_callback:
+            self.status_callback(status)
+        print(f"📊 {status}")
     
-    def process_chapter(self, chapter_index, chapter_info, include_title=True):
-        """Process a single chapter"""
-        chapter_title = chapter_info['title']
-        chapter_content = chapter_info['content']
-        
-        print(f"\n{'='*60}")
-        print(f"📝 Processing Chapter {chapter_index + 1}: {chapter_title}")
-        print(f"{'='*60}")
-        
-        chapter_audio = AudioSegment.empty()
-        
-        # Add chapter title if requested
-        if include_title:
-            chapter_title_audio = self.create_chapter_title_audio(chapter_title)
-            chapter_audio += chapter_title_audio
-            chapter_audio += AudioSegment.silent(duration=1500)  # 1.5 second pause
-        
-        # Split content into manageable segments (paragraphs)
-        paragraphs = self.split_into_paragraphs(chapter_content)
-        
-        for i, paragraph in enumerate(paragraphs):
-            if not paragraph.strip():
-                continue
+    def load_book(self) -> bool:
+        """Load and analyze the book"""
+        try:
+            self._update_progress(0.1, "Extracting text from PDF...")
+            self.full_text = self.director.extract_text_from_pdf(self.pdf_path)
+            
+            self._update_progress(0.2, "Extracting book metadata...")
+            self.metadata = self.director.extract_book_metadata()
+            
+            self._update_progress(0.3, "Detecting chapters...")
+            self.chapters = self.director.detect_chapters()
+            
+            return True
+        except Exception as e:
+            print(f"❌ Error loading book: {e}")
+            return False
+    
+    def analyze_characters(self) -> bool:
+        """Analyze all characters in the book"""
+        try:
+            self._update_progress(0.4, "Analyzing characters (this may take a moment)...")
+            self.character_registry = self.character_designer.analyze_full_book_characters(
+                self.full_text
+            )
+            
+            self._update_progress(0.5, "Generating voice design briefs...")
+            voice_briefs = self.character_designer.generate_voice_design_briefs()
+            
+            self._update_progress(0.6, "Creating voices with MOSS...")
+            
+            # Create voices for each character
+            total_chars = len(self.character_registry)
+            for i, (char_name, _) in enumerate(self.character_registry.items()):
+                if char_name in voice_briefs:
+                    voice_id = self.voice_manager.create_voice_from_description(
+                        char_name,
+                        voice_briefs[char_name]
+                    )
+                    if voice_id:
+                        self.voice_map[char_name] = voice_id
                 
-            print(f"\r📄 Processing paragraph {i+1}/{len(paragraphs)}", end="")
+                # Update progress
+                progress = 0.6 + (0.2 * (i + 1) / total_chars)
+                self._update_progress(progress, f"Created voice for: {char_name}")
             
-            # Analyze this paragraph
-            previous_context = paragraphs[i-1] if i > 0 else ""
-            scene_analysis = self.director.analyze_scene(paragraph, previous_context)
+            # Always add a narrator voice
+            if "narrator" not in self.voice_map:
+                narrator_brief = "A calm, neutral, professional narrator voice, clear articulation, moderate pace, suitable for storytelling."
+                narrator_id = self.voice_manager.create_voice_from_description(
+                    "narrator",
+                    narrator_brief
+                )
+                if narrator_id:
+                    self.voice_map["narrator"] = narrator_id
             
-            # Prepare character info for speaker
-            character_info = {
-                "character": scene_analysis.get("primary_character", "narrator"),
-                "emotion": scene_analysis.get("emotion", "neutral"),
-                "gender": scene_analysis.get("character_gender", "neutral"),
-                "age": scene_analysis.get("character_age", "adult"),
-                "scene_type": scene_analysis.get("scene_type", "narration")
-            }
+            self._update_progress(0.8, f"✅ Created {len(self.voice_map)} voices")
+            return True
             
-            # Generate audio for this paragraph
-            temp_file = os.path.join(self.output_folder, f"temp_para_{chapter_index}_{i}.wav")
-            
-            if self.speaker.generate_audio(paragraph, character_info, temp_file):
-                # Add to chapter audio
-                para_audio = AudioSegment.from_wav(temp_file)
-                chapter_audio += para_audio
-                
-                # Add small pause between paragraphs
-                if i < len(paragraphs) - 1:
-                    pause = AudioSegment.silent(duration=500)  # 500ms pause
-                    chapter_audio += pause
-                
-                # Clean up temp file
-                os.remove(temp_file)
-        
-        print()  # New line after progress
-        return chapter_audio
+        except Exception as e:
+            print(f"❌ Error analyzing characters: {e}")
+            return False
     
-    def split_into_paragraphs(self, text, max_length=1000):
-        """Split text into paragraphs, respecting natural breaks"""
-        paragraphs = []
-        current_para = ""
-        
-        lines = text.split('\n')
-        for line in lines:
-            line_stripped = line.strip()
-            
-            # Skip empty lines that aren't paragraph breaks
-            if not line_stripped and not current_para:
-                continue
-            
-            # If line is empty and we have content, it's a paragraph break
-            if not line_stripped and current_para:
-                paragraphs.append(current_para)
-                current_para = ""
-            elif len(current_para) + len(line_stripped) < max_length:
-                current_para += line_stripped + " "
-            else:
-                # Current paragraph is getting too long, start new one
-                if current_para:
-                    paragraphs.append(current_para)
-                current_para = line_stripped + " "
-        
-        # Add the last paragraph if exists
-        if current_para:
-            paragraphs.append(current_para)
-        
-        return paragraphs
-    
-    def create_chapter_title_audio(self, chapter_title):
-        """Create special audio for chapter titles"""
-        title_notes = {
-            "character": "authoritative_narrator",
-            "emotion": "neutral",
-            "pace": "slow",
-            "voice_type": "authoritative"
-        }
-        
-        temp_file = os.path.join(self.output_folder, "temp_title.wav")
-        title_text = f"Chapter. {chapter_title}"
-        self.speaker.generate_audio(title_text, title_notes, temp_file)
-        
-        title_audio = AudioSegment.from_wav(temp_file)
-        os.remove(temp_file)
-        
-        return title_audio
-    
-    def build_specific_chapters(self, chapter_numbers, output_name=None, include_intro=True):
+    def generate_chapter(self, 
+                        chapter_index: int,
+                        use_mock: bool = False) -> Optional[str]:
         """
-        Build audiobook for specific chapters only
+        Generate a single chapter
         
         Args:
-            chapter_numbers: List of chapter numbers (1-indexed) or range string
-            output_name: Custom output filename (without extension)
-            include_intro: Whether to include book introduction
+            chapter_index: 0-based chapter index
+            use_mock: If True, use mock voice IDs (for testing without MOSS)
+            
+        Returns:
+            Path to generated audio file or None
         """
-        # Parse chapter numbers
-        chapters_to_process = self.parse_chapter_selection(chapter_numbers)
+        if chapter_index >= len(self.chapters):
+            print(f"❌ Chapter {chapter_index} not found")
+            return None
         
-        if not chapters_to_process:
-            print("❌ No valid chapters selected.")
-            return
+        chapter = self.chapters[chapter_index]
+        chapter_num = chapter.get('number', chapter_index + 1)
+        chapter_title = chapter.get('title', f'Chapter {chapter_num}')
         
-        print(f"\n🎯 Selected {len(chapters_to_process)} chapter(s): {chapters_to_process}")
+        self._update_progress(
+            0.0,
+            f"📝 Processing Chapter {chapter_num}: {chapter_title[:50]}..."
+        )
         
-        master_audio = AudioSegment.empty()
+        # Parse chapter into scenes
+        scene_data = self.character_designer.parse_dialogue_scene(chapter['content'])
         
-        # Add introduction if requested
-        if include_intro:
-            print("\n🎤 Adding book introduction...")
-            intro_audio = self.create_book_introduction()
-            master_audio += intro_audio
-            master_audio += AudioSegment.silent(duration=2000)  # 2 second pause
+        if not scene_data or 'scenes' not in scene_data:
+            print(f"⚠️ No scenes detected, treating as single scene")
+            scene_data = {
+                'scenes': [{
+                    'location': 'unknown',
+                    'characters_present': ['narrator'],
+                    'dialogue_turns': [],
+                    'narration': chapter['content'][:5000]  # Limit length
+                }]
+            }
         
-        # Process selected chapters
-        for idx, chapter_num in enumerate(chapters_to_process):
-            chapter_idx = chapter_num - 1  # Convert to 0-indexed
+        # Prepare voice map for this chapter
+        chapter_voice_map = {}
+        if use_mock:
+            # Use mock IDs for testing
+            for char_name in self.character_registry:
+                chapter_voice_map[char_name] = self.voice_manager.get_mock_voice_id(char_name)
+            chapter_voice_map['narrator'] = 'mock_narrator'
+        else:
+            chapter_voice_map = self.voice_map.copy()
+        
+        # Generate each scene
+        chapter_audio = AudioSegment.empty()
+        scene_files = []
+        
+        for i, scene in enumerate(scene_data.get('scenes', [])):
+            self._update_progress(
+                (i + 1) / len(scene_data['scenes']),
+                f"  Generating scene {i+1}/{len(scene_data['scenes'])}"
+            )
+            
+            scene_file = self.output_dir / f"chapter_{chapter_num:02d}_scene_{i+1:02d}.wav"
+            
+            # Add emotion modulation for each dialogue turn
+            for turn in scene.get('dialogue_turns', []):
+                speaker = turn.get('speaker')
+                emotion = turn.get('emotion', 'neutral')
+                
+                if speaker in self.character_registry:
+                    # Get emotion modulation parameters
+                    context = f"{turn.get('context_before', '')} {turn.get('text', '')}"
+                    modulation = self.character_designer.get_emotion_modulation(
+                        speaker,
+                        emotion,
+                        context
+                    )
+                    turn['emotion_params'] = modulation
+            
+            if use_mock:
+                # For testing, create silent audio
+                duration_ms = len(scene.get('narration', '')) * 50  # Rough estimate
+                silent_audio = AudioSegment.silent(duration=min(duration_ms, 30000))
+                silent_audio.export(scene_file, format="wav")
+                chapter_audio += silent_audio
+                scene_files.append(scene_file)
+            else:
+                # Generate real audio with MOSS
+                success = self.voice_manager.generate_dialogue_scene(
+                    scene,
+                    chapter_voice_map,
+                    str(scene_file)
+                )
+                
+                if success and scene_file.exists():
+                    scene_audio = AudioSegment.from_wav(str(scene_file))
+                    chapter_audio += scene_audio
+                    scene_files.append(str(scene_file))
+            
+            # Add pause between scenes
+            if i < len(scene_data['scenes']) - 1:
+                chapter_audio += AudioSegment.silent(duration=1000)
+        
+        # Export chapter audio
+        chapter_output = self.output_dir / f"chapter_{chapter_num:02d}.mp3"
+        chapter_audio.export(str(chapter_output), format="mp3", bitrate="192k")
+        
+        # Clean up scene files (optional)
+        for scene_file in scene_files:
+            try:
+                os.remove(scene_file)
+            except:
+                pass
+        
+        self._update_progress(1.0, f"✅ Chapter {chapter_num} complete")
+        return str(chapter_output)
+    
+    def generate_chapters(self, 
+                         chapter_selection: List[int],
+                         use_mock: bool = False) -> List[str]:
+        """
+        Generate multiple chapters
+        
+        Args:
+            chapter_selection: List of chapter numbers (1-indexed)
+            use_mock: If True, use mock voices for testing
+            
+        Returns:
+            List of generated audio file paths
+        """
+        generated_files = []
+        
+        for i, chapter_num in enumerate(chapter_selection):
+            # Convert to 0-indexed
+            chapter_idx = chapter_num - 1
             
             if 0 <= chapter_idx < len(self.chapters):
-                chapter_info = self.chapters[chapter_idx]
-                
-                # Process chapter
-                chapter_audio = self.process_chapter(
-                    chapter_idx, 
-                    chapter_info, 
-                    include_title=True
+                # Update overall progress
+                overall_progress = i / len(chapter_selection)
+                self._update_progress(
+                    overall_progress,
+                    f"Processing chapter {chapter_num}/{chapter_selection[-1]}"
                 )
                 
-                master_audio += chapter_audio
-                
-                # Save individual chapter file
-                chapter_filename = os.path.join(
-                    self.output_folder, 
-                    f"chapter_{chapter_num:02d}_selected.wav"
-                )
-                chapter_audio.export(chapter_filename, format="wav")
-                print(f"💾 Saved individual chapter: {chapter_filename}")
-                
-                # Add chapter break (except after last chapter)
-                if idx < len(chapters_to_process) - 1:
-                    master_audio += AudioSegment.silent(duration=3000)  # 3 second pause
-            else:
-                print(f"⚠️ Chapter {chapter_num} not found. Skipping.")
+                # Generate chapter
+                chapter_file = self.generate_chapter(chapter_idx, use_mock)
+                if chapter_file:
+                    generated_files.append(chapter_file)
         
-        # Generate output filename
-        if not output_name:
-            chapter_str = "-".join(str(c) for c in chapters_to_process)
-            output_name = f"{self.book_metadata['title'].replace(' ', '_')}_chapters_{chapter_str}"
+        # If multiple chapters, combine them
+        if len(generated_files) > 1:
+            self._combine_chapters(generated_files, chapter_selection)
         
-        # Export final audiobook
-        output_filename = f"{output_name}.mp3"
-        print(f"\n🎬 Exporting selected chapters to: {output_filename}")
-        master_audio.export(output_filename, format="mp3", bitrate="192k")
-        
-        print(f"\n✅ SUCCESS! Selected chapters created:")
-        print(f"📁 Final file: {output_filename}")
-        print(f"⏱️ Total duration: {len(master_audio) / 1000 / 60:.1f} minutes")
+        return generated_files
     
-    def build_chapter_range(self, start_chapter, end_chapter, **kwargs):
-        """
-        Build audiobook for a range of chapters
+    def _combine_chapters(self, chapter_files: List[str], chapter_numbers: List[int]):
+        """Combine multiple chapters into one audiobook"""
+        combined = AudioSegment.empty()
         
-        Args:
-            start_chapter: First chapter to include (1-indexed)
-            end_chapter: Last chapter to include (1-indexed)
-        """
-        chapter_range = list(range(start_chapter, end_chapter + 1))
-        return self.build_specific_chapters(chapter_range, **kwargs)
-    
-    def parse_chapter_selection(self, selection):
-        """
-        Parse various chapter selection formats
+        # Add introduction
+        intro_text = f"{self.metadata.get('title', 'Audiobook')}. By {self.metadata.get('author', 'Unknown')}."
         
-        Supported formats:
-        - Single number: 5
-        - List: [1, 3, 5]
-        - Range: "1-5" or "1:5"
-        - Mixed: "1,3,5-8"
-        """
-        if isinstance(selection, (list, tuple)):
-            # Already a list of numbers
-            return [int(c) for c in selection if 1 <= int(c) <= len(self.chapters)]
+        # Generate intro with narrator voice
+        intro_file = self.output_dir / "00_introduction.wav"
+        if self.voice_manager.generate_dialogue_scene(
+            {'dialogue_turns': [], 'narration': intro_text},
+            {'narrator': self.voice_map.get('narrator', 'default')},
+            str(intro_file)
+        ):
+            combined += AudioSegment.from_wav(str(intro_file))
+            combined += AudioSegment.silent(duration=2000)
         
-        if isinstance(selection, int):
-            # Single number
-            return [selection] if 1 <= selection <= len(self.chapters) else []
-        
-        if isinstance(selection, str):
-            # Parse string format
-            chapters = set()
+        # Add chapters
+        for i, chapter_file in enumerate(chapter_files):
+            chapter_audio = AudioSegment.from_mp3(chapter_file)
+            combined += chapter_audio
             
-            # Handle different separators
-            selection = selection.replace(':', '-')
-            parts = selection.split(',')
-            
-            for part in parts:
-                part = part.strip()
-                if '-' in part:
-                    # Range like "1-5"
-                    try:
-                        start, end = map(int, part.split('-'))
-                        for ch in range(start, end + 1):
-                            if 1 <= ch <= len(self.chapters):
-                                chapters.add(ch)
-                    except:
-                        continue
-                else:
-                    # Single chapter
-                    try:
-                        ch = int(part)
-                        if 1 <= ch <= len(self.chapters):
-                            chapters.add(ch)
-                    except:
-                        continue
-            
-            return sorted(list(chapters))
+            if i < len(chapter_files) - 1:
+                combined += AudioSegment.silent(duration=3000)
         
-        return []
+        # Export combined
+        if len(chapter_numbers) == len(self.chapters):
+            output_name = f"{self.metadata.get('title', 'book').replace(' ', '_')}_complete.mp3"
+        else:
+            range_str = f"chapters_{chapter_numbers[0]}_{chapter_numbers[-1]}"
+            output_name = f"{self.metadata.get('title', 'book').replace(' ', '_')}_{range_str}.mp3"
+        
+        combined_output = self.output_dir / output_name
+        combined.export(str(combined_output), format="mp3", bitrate="192k")
+        print(f"✅ Combined audiobook saved: {combined_output}")
+        
+        return str(combined_output)
     
-    def build_all_chapters(self):
-        """Build complete audiobook with all chapters"""
-        self.build_specific_chapters(
-            list(range(1, len(self.chapters) + 1)),
-            output_name=f"{self.book_metadata['title'].replace(' ', '_')}_complete",
-            include_intro=True
-        )
+    def generate_all_chapters(self, use_mock: bool = False) -> List[str]:
+        """Generate all chapters in the book"""
+        chapter_numbers = list(range(1, len(self.chapters) + 1))
+        return self.generate_chapters(chapter_numbers, use_mock)
     
-    def create_manifest(self, selected_chapters=None):
-        """Create a JSON manifest with chapter information"""
+    def save_manifest(self):
+        """Save generation manifest"""
         manifest = {
-            "book": self.book_metadata,
-            "chapters": [],
+            "book": self.metadata,
             "total_chapters": len(self.chapters),
-            "output_folder": self.output_folder,
-            "selected_chapters": selected_chapters
+            "characters": list(self.character_registry.keys()),
+            "voices_created": list(self.voice_map.keys()),
+            "chapters": []
         }
         
         for i, chapter in enumerate(self.chapters):
-            chapter_file = f"chapter_{i+1:02d}.wav"
             manifest["chapters"].append({
-                "number": i + 1,
-                "title": chapter['title'],
-                "file": chapter_file,
-                "word_count": len(chapter['content'].split()),
-                "included_in_selection": (selected_chapters is None) or ((i+1) in selected_chapters)
+                "number": chapter.get('number', i+1),
+                "title": chapter.get('title', f'Chapter {i+1}'),
+                "word_count": len(chapter.get('content', '').split()),
+                "characters_in_chapter": []  # Could be populated by scene analysis
             })
         
-        manifest_file = os.path.join(self.output_folder, "manifest.json")
+        manifest_file = self.output_dir / "manifest.json"
         with open(manifest_file, 'w') as f:
             json.dump(manifest, f, indent=2)
         
-        print(f"📋 Manifest created: {manifest_file}")
-
-def get_user_selection():
-    """Get chapter selection from user interactively"""
-    print("\n" + "="*60)
-    print("   CHAPTER SELECTION MENU   ")
-    print("="*60)
-    print("1. Process all chapters")
-    print("2. Process specific chapters (e.g., 1,3,5 or 1-5)")
-    print("3. Process a range of chapters (e.g., 3 to 7)")
-    print("4. Process single chapter")
-    print("0. Exit")
-    print("-"*60)
-    
-    choice = input("Enter your choice (0-4): ").strip()
-    
-    return choice
-
-if __name__ == "__main__":
-    pdf_path = r"C:\Users\Rahul Dev\OneDrive\Desktop\Projects2026\emotioal-audiobook-agent\If He Had Been with Me.pdf"
-    
-    print("🚀 Initializing Enhanced Audiobook Agent...")
-    agent = ChapterBasedAudiobookAgent(pdf_path)
-    
-    while True:
-        choice = get_user_selection()
-        
-        if choice == "0":
-            print("👋 Exiting...")
-            break
-            
-        elif choice == "1":
-            # Process all chapters
-            print("\n📚 Processing ALL chapters...")
-            agent.build_all_chapters()
-            agent.create_manifest()
-            break
-            
-        elif choice == "2":
-            # Process specific chapters
-            selection = input("\nEnter chapter numbers (e.g., '1,3,5' or '1-5,7-10'): ").strip()
-            output_name = input("Output filename (without extension, press Enter for default): ").strip()
-            include_intro = input("Include book introduction? (y/n, default=y): ").strip().lower() != 'n'
-            
-            agent.build_specific_chapters(
-                selection,
-                output_name=output_name if output_name else None,
-                include_intro=include_intro
-            )
-            selected = agent.parse_chapter_selection(selection)
-            agent.create_manifest(selected)
-            break
-            
-        elif choice == "3":
-            # Process range of chapters
-            try:
-                start = int(input("Start chapter: ").strip())
-                end = int(input("End chapter: ").strip())
-                output_name = input("Output filename (without extension, press Enter for default): ").strip()
-                include_intro = input("Include book introduction? (y/n, default=y): ").strip().lower() != 'n'
-                
-                agent.build_chapter_range(
-                    start, 
-                    end,
-                    output_name=output_name if output_name else None,
-                    include_intro=include_intro
-                )
-                agent.create_manifest(list(range(start, end + 1)))
-            except ValueError:
-                print("❌ Invalid chapter numbers. Please enter integers.")
-            break
-            
-        elif choice == "4":
-            # Process single chapter
-            try:
-                chapter_num = int(input("Chapter number: ").strip())
-                output_name = input("Output filename (without extension, press Enter for default): ").strip()
-                include_intro = input("Include book introduction? (y/n, default=y): ").strip().lower() != 'n'
-                
-                agent.build_specific_chapters(
-                    [chapter_num],
-                    output_name=output_name if output_name else None,
-                    include_intro=include_intro
-                )
-                agent.create_manifest([chapter_num])
-            except ValueError:
-                print("❌ Invalid chapter number.")
-            break
-            
-        else:
-            print("❌ Invalid choice. Please try again.")
+        print(f"📋 Manifest saved: {manifest_file}")

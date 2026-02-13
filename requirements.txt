@@ -1,12 +1,34 @@
-pymupdf
-python-dotenv
-kokoro 
-soundfile
-groq
-huggingface_hub
-pydub
-numpy
-streamlit
-librosa
-pyaudio
+# Core PDF processing
+pymupdf>=1.24.0
+
+# Environment management
+python-dotenv>=1.0.0
+
+# LLM integration
+groq>=0.9.0
+
+# Audio processing
+pydub>=0.25.1
+librosa>=0.10.0
+soundfile>=0.12.1
+numpy>=1.24.0
+ffmpeg-python>=0.2.0
+
+# MOSS-TTS dependencies
+torch>=2.1.0
+torchaudio>=2.1.0
+transformers>=4.36.0
+accelerate>=0.26.0
+
+# Utilities
+requests>=2.31.0
+tqdm>=4.66.0
+Pillow>=10.0.0
+
+# Web interface
+streamlit>=1.29.0
+
+# For voice cloning/download
+huggingface_hub>=0.20.0
+
 # --- IGNORE ---
