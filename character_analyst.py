@@ -61,12 +61,24 @@ class CharacterVoiceDesigner:
             """
             
             try:
-                response = self.client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[{"role": "user", "content": prompt}],
-                    response_format={"type": "json_object"},
-                    temperature=0.3
-                )
+                import time
+                retries = 3
+                for attempt in range(retries):
+                    try:
+                        response = self.client.chat.completions.create(
+                            model="llama-3.1-8b-instant",
+                            messages=[{"role": "user", "content": prompt}],
+                            response_format={"type": "json_object"},
+                            temperature=0.3
+                        )
+                        break
+                    except Exception as e:
+                        if "429" in str(e) and attempt < retries - 1:
+                            time.sleep(10 * (attempt + 1))
+                            continue
+                        raise e
+                
+                time.sleep(1.5) # Safe buffer for free tier
                 
                 chunk_characters = json.loads(response.choices[0].message.content)
                 
@@ -149,11 +161,23 @@ class CharacterVoiceDesigner:
             """
             
             try:
-                response = self.client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.5
-                )
+                import time
+                retries = 3
+                for attempt in range(retries):
+                    try:
+                        response = self.client.chat.completions.create(
+                            model="llama-3.1-8b-instant",
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0.5
+                        )
+                        break
+                    except Exception as e:
+                        if "429" in str(e) and attempt < retries - 1:
+                            time.sleep(10 * (attempt + 1))
+                            continue
+                        raise e
+                
+                time.sleep(1) # Safe buffer for free tier
                 
                 voice_briefs[char_name] = response.choices[0].message.content.strip()
                 print(f"  ✓ Generated voice for: {char_name}")
@@ -195,7 +219,7 @@ class CharacterVoiceDesigner:
         
         try:
             response = self.client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model="llama-3.1-8b-instant",
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
                 temperature=0.3
@@ -247,7 +271,7 @@ class CharacterVoiceDesigner:
         
         try:
             response = self.client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model="llama-3.1-8b-instant",
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
                 temperature=0.2

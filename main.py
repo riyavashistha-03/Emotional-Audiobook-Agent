@@ -53,6 +53,7 @@ class StoryDirector:
         
         try:
             response = self.client.chat.completions.create(
+                
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
@@ -68,114 +69,234 @@ class StoryDirector:
             return self.metadata
     
     def detect_chapters(self) -> List[Dict]:
-        """Detect chapter boundaries using AI and regex"""
+        """Detect chapter boundaries using Table of Contents first, then regex/AI"""
         print("📑 Detecting chapters...")
         
-        # First try regex-based detection
-        chapter_patterns = [
-            r'CHAPTER\s+(\d+)[\.\s]',
-            r'Chapter\s+(\d+)[\.\s]',
-            r'^(\d+)\.\s+',  # Numbered at start of line
-            r'\n(\d+)\.\s+',  # Numbered after newline
-            r"(?i)CHAPTER\s+(?:[0-9]+|[A-Z]+)"
-        ]
+        # First, try to extract chapters from Table of Contents
+        chapters = self._extract_chapters_from_toc()
         
-        lines = self.full_text.split('\n')
-        chapters = []
-        current_chapter = {"title": "Prologue/Start", "content": "", "number": 0}
+        if chapters and len(chapters) > 5:
+            print(f"✅ Found {len(chapters)} chapters from Table of Contents")
+            self.chapters = chapters
+            return chapters
         
-        for line in lines:
-            line_stripped = line.strip()
-            if not line_stripped:
-                current_chapter["content"] += "\n"
-                continue
-                
-            # Check for chapter markers
-            is_chapter = False
-            chapter_num = None
-            
-            for pattern in chapter_patterns:
-                match = re.match(pattern, line_stripped, re.IGNORECASE)
-                if match:
-                    is_chapter = True
-                    try:
-                        chapter_num = int(match.group(1))
-                    except:
-                        chapter_num = len(chapters) + 1
-                    break
-            
-            # Skip table of contents, etc.
-            skip_words = ['contents', 'index', 'preface', 'foreword', 'acknowledgements']
-            if any(word in line_stripped.lower() for word in skip_words) and len(line_stripped) < 50:
-                continue
-            
-            if is_chapter and len(current_chapter["content"]) > 200:
-                # Save current chapter
-                if current_chapter["content"].strip():
-                    chapters.append(current_chapter.copy())
-                
-                # Start new chapter
-                current_chapter = {
-                    "title": line_stripped,
-                    "content": "",
-                    "number": chapter_num or (len(chapters) + 1)
-                }
-            else:
-                current_chapter["content"] += line + '\n'
+        print("⚠️ Table of Contents extraction didn't find enough chapters, trying pattern matching...")
         
-        # Add last chapter
-        if current_chapter["content"].strip():
-            chapters.append(current_chapter)
+        # Fallback: use regex-based detection for simple number markers
+        chapters = self._detect_chapters_by_page_numbers()
         
-        # If regex found too few chapters, use AI
-        if len(chapters) < 3 and len(self.full_text) > 10000:
-            chapters = self._ai_chapter_detection()
+        if chapters and len(chapters) > 5:
+            print(f"✅ Found {len(chapters)} chapters from page numbers")
+            self.chapters = chapters
+            return chapters
+        
+        # Final fallback: use AI detection
+        print("⚠️ Pattern matching found too few chapters, using AI detection...")
+        chapters = self._ai_chapter_detection()
         
         self.chapters = chapters
         print(f"✅ Found {len(chapters)} chapters")
         return chapters
     
-    def _ai_chapter_detection(self) -> List[Dict]:
-        """Use AI to detect chapters when regex fails"""
-        prompt = f"""
-        Identify the chapter boundaries in this book.
+    def _extract_chapters_from_toc(self) -> List[Dict]:
+        """Extract chapters from Table of Contents"""
+        print("🔍 Scanning for Table of Contents...")
         
-        TEXT (first 5000 chars):
-        {self.full_text[:5000]}...
+        # Look for "Table of Contents" or similar
+        lines = self.full_text.split('\n')
+        toc_start = -1
+        toc_end = -1
         
-        Return a JSON list of chapters with:
-        [
-            {{
-                "title": "chapter title",
-                "number": chapter_number,
-                "start_position": "approximate start text"
-            }}
+        # Find TOC section
+        for i, line in enumerate(lines):
+            lower_line = line.lower().strip()
+            if 'table of contents' in lower_line or 'contents' in lower_line:
+                toc_start = i
+                print(f"📚 Found Table of Contents at line {i}")
+                break
+        
+        if toc_start == -1:
+            return []
+        
+        # Find end of TOC (usually when we hit actual chapter content)
+        for i in range(toc_start + 1, min(toc_start + 500, len(lines))):
+            line = lines[i].strip()
+            # TOC ends when we encounter substantial body text or chapter numbering with page numbers
+            if line and len(line) > 80 and not any(c.isdigit() for c in line):
+                toc_end = i
+                break
+            # Or if we hit a clear chapter start marker
+            if re.match(r'^(CHAPTER\s+\d+|Chapter\s+\d+|^\d+$)', line, re.IGNORECASE):
+                if i > toc_start + 5:  # Make sure we're past the TOC header
+                    toc_end = i
+                    break
+        
+        if toc_end == -1:
+            toc_end = min(toc_start + 300, len(lines))
+        
+        # Extract TOC text
+        toc_text = '\n'.join(lines[toc_start:toc_end])
+        print(f"📄 TOC section: {len(toc_text)} characters")
+        
+        # Parse TOC entries - look for patterns like:
+        # 1. Chapter Title         5
+        # Chapter 1: Title         10
+        # 1 - Title               12
+        chapters = []
+        toc_patterns = [
+            (r'^(\d+)\s*[\.\-\s]+(.+?)(?:\s+(\d+))?$', 'number_title'),  # 1. Title [page]
+            (r'(?i)^chapter\s+(\d+)[\.\:\-\s]+(.+?)(?:\s+(\d+))?$', 'chapter_title'),  # Chapter 1: Title [page]
         ]
         
-        Include ALL chapters. If no clear chapters, treat as single chapter.
+        for line in toc_text.split('\n'):
+            line = line.strip()
+            if not line or len(line) < 3:
+                continue
+            
+            chapter_num = None
+            chapter_title = None
+            
+            for pattern, pattern_type in toc_patterns:
+                match = re.match(pattern, line, re.IGNORECASE)
+                if match:
+                    groups = match.groups()
+                    chapter_num = groups[0]
+                    chapter_title = groups[1] if len(groups) > 1 else f"Chapter {chapter_num}"
+                    
+                    try:
+                        chapter_num = int(chapter_num)
+                    except:
+                        chapter_num = len(chapters) + 1
+                    
+                    # Clean up title
+                    if chapter_title:
+                        chapter_title = chapter_title.strip()
+                    
+                    chapters.append({
+                        "number": chapter_num,
+                        "title": chapter_title or f"Chapter {chapter_num}",
+                        "content": "",
+                    })
+                    break
+        
+        return chapters if len(chapters) > 0 else []
+    
+    def _detect_chapters_by_page_numbers(self) -> List[Dict]:
+        """Detect chapters by finding simple number markers at start of lines"""
+        print("🔢 Detecting chapter numbers in text...")
+        
+        lines = self.full_text.split('\n')
+        chapters = []
+        
+        # Look for standalone numbers (1, 2, 3, etc)
+        expected_chapter_num = 1
+        
+        for i, line in enumerate(lines):
+            line_stripped = line.strip()
+            
+            # Check if line is just a number
+            if line_stripped.isdigit():
+                chapter_num = int(line_stripped)
+                
+                # Accept if it matches expected sequence or if it's a reasonable chapter number
+                if chapter_num == expected_chapter_num or chapter_num < 200:
+                    # Get next non-empty line as potential title
+                    chapter_title = f"Chapter {chapter_num}"
+                    for j in range(i + 1, min(i + 5, len(lines))):
+                        next_line = lines[j].strip()
+                        if next_line and len(next_line) < 100:
+                            chapter_title = next_line
+                            break
+                    
+                    chapters.append({
+                        "number": chapter_num,
+                        "title": chapter_title,
+                        "content": "",
+                    })
+                    
+                    expected_chapter_num = chapter_num + 1
+        
+        return chapters if len(chapters) > 5 else []
+    
+    def _ai_chapter_detection(self) -> List[Dict]:
+        """Use AI to detect chapters when regex fails"""
+        print("🤖 Using AI to detect all chapters...")
+        
+        prompt = f"""
+        Analyze this book text and identify ALL chapter boundaries and titles.
+        
+        IMPORTANT: Find EVERY SINGLE chapter, no matter the format.
+        
+        TEXT (first 8000 characters):
+        {self.full_text[:8000]}...
+        
+        Return a JSON array with all chapters in this format:
+        [
+            {{"number": 1, "title": "Chapter One"}},
+            {{"number": 2, "title": "Chapter Two"}},
+            ...
+        ]
+        
+        Look for:
+        - Lines starting with "Chapter"
+        - Lines with just numbers (1, 2, 3...)
+        - Roman numerals (I, II, III...)
+        - Part/Book designations
+        
+        Include EVERY chapter. Return as a JSON array ONLY.
         """
         
         try:
             response = self.client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-                temperature=0.2
+                temperature=0.1
             )
             
-            ai_chapters = json.loads(response.choices[0].message.content)
+            response_text = response.choices[0].message.content
+            
+            # Try to parse JSON
+            try:
+                ai_chapters = json.loads(response_text)
+            except:
+                # If not valid JSON, try to extract chapter list
+                ai_chapters = []
+                lines = response_text.split('\n')
+                for line in lines:
+                    if 'number' in line.lower() or 'chapter' in line.lower():
+                        try:
+                            # Try to parse as JSON object
+                            if '{' in line and '}' in line:
+                                chapter_obj = json.loads(line)
+                                ai_chapters.append(chapter_obj)
+                        except:
+                            pass
             
             # Convert to our format
             chapters = []
-            if isinstance(ai_chapters, list):
-                for i, ch in enumerate(ai_chapters):
-                    chapters.append({
-                        "title": ch.get("title", f"Chapter {i+1}"),
-                        "content": f"[Chapter {i+1} content]",  # Placeholder
-                        "number": ch.get("number", i+1)
-                    })
-            return chapters
-        except:
+            if isinstance(ai_chapters, list) and len(ai_chapters) > 0:
+                for ch in ai_chapters:
+                    if isinstance(ch, dict):
+                        chapters.append({
+                            "title": ch.get("title", f"Chapter {ch.get('number', len(chapters)+1)}"),
+                            "content": "",  # Will be populated from full text
+                            "number": ch.get("number", len(chapters)+1)
+                        })
+                    else:
+                        chapters.append({
+                            "title": str(ch),
+                            "content": "",
+                            "number": len(chapters) + 1
+                        })
+            
+            if chapters:
+                print(f"✅ AI detected {len(chapters)} chapters")
+                return chapters
+            else:
+                raise Exception("No chapters parsed")
+                
+        except Exception as e:
+            print(f"⚠️ AI detection failed: {e}")
             # Fallback: treat whole book as one chapter
             return [{
                 "title": "Complete Book",

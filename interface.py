@@ -1,501 +1,198 @@
 import streamlit as st
 import tempfile
 import os
+import sys
 from pathlib import Path
 import time
 import json
 import glob
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
+# --- SYSTEM DIAGNOSTICS & SHIELD ---
+MISSING_DEPS = []
+try:
+    import groq
+except ImportError: MISSING_DEPS.append("groq")
+try:
+    import fitz
+except ImportError: MISSING_DEPS.append("pymupdf")
+try:
+    from pydub import AudioSegment
+except ImportError: MISSING_DEPS.append("pydub")
+try:
+    import soundfile
+except ImportError: MISSING_DEPS.append("soundfile")
+
+# Load environment variables
 load_dotenv()
 
-# Set page config must be the first Streamlit command
+# --- INITIALIZATION ---
+if 'orchestrator' not in st.session_state:
+    st.session_state.orchestrator = None
+if 'chapters' not in st.session_state:
+    st.session_state.chapters = []
+if 'book_loaded' not in st.session_state:
+    st.session_state.book_loaded = False
+if 'current_progress' not in st.session_state:
+    st.session_state.current_progress = 0
+if 'current_status' not in st.session_state:
+    st.session_state.current_status = "Waiting for upload..."
+if 'generated_files' not in st.session_state:
+    st.session_state.generated_files = []
+
+# Page Configuration
 st.set_page_config(
-    page_title="Emotional Audiobook Studio",
+    page_title="Emotional Audiobook Agent | Kokoro Studio",
     page_icon="🎧",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Initialize session state
-if 'orchestrator' not in st.session_state:
-    st.session_state.orchestrator = None
-if 'chapters' not in st.session_state:
-    st.session_state.chapters = []
-if 'generated_files' not in st.session_state:
-    st.session_state.generated_files = []
-if 'current_progress' not in st.session_state:
-    st.session_state.current_progress = 0
-if 'current_status' not in st.session_state:
-    st.session_state.current_status = "Ready"
-if 'book_loaded' not in st.session_state:
-    st.session_state.book_loaded = False
-if 'file_path' not in st.session_state:
-    st.session_state.file_path = None
-
-# Custom CSS for modern look with bright and muted colors
+# --- OBSIDIAN RESONANCE DESIGN SYSTEM ---
 st.markdown("""
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;800&family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
 <style>
-    /* Main background with gradient */
-    .stApp {
-        background: linear-gradient(135deg, #f5f0e8 0%, #e8dfd3 100%);
+    :root {
+        --bg: #0b1326;
+        --surface: #131b2e;
+        --surface-high: #222a3d;
+        --primary: #8B5CF6;
+        --primary-glow: rgba(139, 92, 246, 0.4);
+        --text: #dae2fd;
+        --text-muted: #958ea0;
+        --glass: rgba(45, 52, 73, 0.4);
+        --glass-border: rgba(255, 255, 255, 0.1);
+        --radius: 1.5rem;
     }
-    
-    /* Headers */
-    h1 {
-        color: #4a3b2f !important;
-        font-family: 'Inter', sans-serif !important;
-        font-weight: 600 !important;
-        letter-spacing: -0.5px !important;
-    }
-    
-    h2, h3 {
-        color: #5c4b3a !important;
-        font-family: 'Inter', sans-serif !important;
-    }
-    
-    /* Buttons */
-    .stButton > button {
-        background: linear-gradient(90deg, #ff7e5f 0%, #feb47b 100%);
-        color: white;
-        border: none;
-        padding: 0.75rem 2rem;
-        border-radius: 50px;
-        font-weight: 600;
-        font-size: 1rem;
-        transition: all 0.3s ease;
-        box-shadow: 0 4px 15px rgba(255, 126, 95, 0.3);
-    }
-    
-    .stButton > button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 6px 20px rgba(255, 126, 95, 0.4);
-    }
-    
-    /* Secondary button */
-    .stButton > button[kind="secondary"] {
-        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
-    }
-    
-    /* File uploader */
-    .stFileUploader {
-        border: 2px dashed #c4b5a0;
-        border-radius: 15px;
-        padding: 1rem;
-        background: rgba(255, 255, 255, 0.5);
-    }
-    
-    /* Progress bar */
-    .stProgress > div > div {
-        background: linear-gradient(90deg, #ff7e5f 0%, #feb47b 100%);
-    }
-    
-    /* Success messages */
-    .stSuccess {
-        background: linear-gradient(135deg, #84fab0 0%, #8fd3f4 100%);
-        color: #2c3e50;
-        border: none;
-        border-radius: 10px;
-        padding: 1rem;
-    }
-    
-    /* Info boxes */
-    .stInfo {
-        background: rgba(255, 255, 255, 0.7);
-        border-left: 5px solid #ff7e5f;
-        color: #4a3b2f;
-    }
-    
-    /* Sidebar */
-    .css-1d391kg {
-        background: rgba(255, 255, 255, 0.9);
-        backdrop-filter: blur(10px);
-    }
-    
-    /* Audio player */
-    audio {
-        width: 100%;
-        border-radius: 30px;
-        margin: 1rem 0;
-    }
-    
-    /* Cards for chapters */
-    .chapter-card {
-        background: white;
-        border-radius: 15px;
-        padding: 1rem;
-        margin: 0.5rem 0;
-        box-shadow: 0 2px 10px rgba(0,0,0,0.05);
-        border: 1px solid rgba(196, 181, 160, 0.3);
-    }
-    
-    /* Colorful accents */
-    .accent-1 {
-        color: #ff7e5f;
-    }
-    .accent-2 {
-        color: #667eea;
-    }
-    .accent-3 {
-        color: #84fab0;
-    }
-    
-    /* Dividers */
-    hr {
-        background: linear-gradient(90deg, transparent, #c4b5a0, transparent);
-        height: 2px;
-        border: none;
-    }
+    .stApp { background-color: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; }
+    h1, h2, h3 { font-family: 'Manrope', sans-serif !important; font-weight: 800 !important; color: white !important; }
+    .hero-title { font-size: 3.5rem; margin-bottom: 0.5rem; background: linear-gradient(135deg, white 0%, var(--primary) 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    .glass-card { background: var(--glass); backdrop-filter: blur(12px); border: 1px solid var(--glass-border); border-radius: var(--radius); padding: 2.5rem; margin-bottom: 2rem; }
+    .stButton > button { background: linear-gradient(135deg, var(--primary) 0%, #6d3bd7 100%); color: white !important; border-radius: 50px !important; letter-spacing: 0.1rem; box-shadow: 0 4px 15px var(--primary-glow) !important; width: 100%; transition: all 0.3s ease; }
+    .stButton > button:hover { transform: translateY(-3px); box-shadow: 0 8px 25px var(--primary-glow) !important; }
+    .diagnostic { background: rgba(255, 107, 107, 0.1); border: 1px solid #ff6b6b; padding: 1.5rem; border-radius: var(--radius); margin-bottom: 2rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# Header
-col1, col2, col3 = st.columns([1, 2, 1])
-with col2:
-    st.markdown("<h1 style='text-align: center;'>🎧 Emotional Audiobook Studio</h1>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align: center; color: #6b5a48;'>Transform your PDF books into narrated audiobooks with AI-generated character voices</p>", unsafe_allow_html=True)
-
-st.markdown("---")
-
-# Sidebar configuration
+# --- SIDEBAR: CONFIGURATION ---
 with st.sidebar:
-    st.markdown("<h2 style='color: #4a3b2f;'>🎛️ Configuration</h2>", unsafe_allow_html=True)
-    
-    # Check if API key is available from environment
-    groq_api_key = os.getenv("GROQ_API_KEY")
-    
-    if groq_api_key:
-        st.success("✅ GROQ API key found in environment")
-        # Optional: Allow override
-        with st.expander("Override API Key (optional)"):
-            override_key = st.text_input("Alternative GROQ API Key", type="password")
-            if override_key:
-                groq_api_key = override_key
-                os.environ["GROQ_API_KEY"] = override_key
-                st.success("✅ Using override key")
+    st.markdown("<h2 style='color: white;'>⚙️ Configuration</h2>", unsafe_allow_html=True)
+    groq_api_key = os.getenv("GROQ_API_KEY", "")
+    if not groq_api_key:
+        groq_api_key = st.text_input("GROQ API Key", type="password")
     else:
-        st.warning("⚠️ GROQ API key not found in environment")
-        groq_api_key = st.text_input("Enter GROQ API Key", type="password", 
-                                     help="Get one from console.groq.com")
-        if groq_api_key:
-            os.environ["GROQ_API_KEY"] = groq_api_key
-            st.success("✅ API key saved for this session")
+        st.success("✅ GROQ API Key Active")
     
-    # Create .env file helper
-    if not os.path.exists(".env") and groq_api_key:
-        if st.button("💾 Save to .env file (permanent)"):
-            with open(".env", "w") as f:
-                f.write(f"GROQ_API_KEY={groq_api_key}\n")
-                f.write("# MOSS-TTS URL (default: localhost)\n")
-                f.write("MOSS_API_URL=http://localhost:7860\n")
-            st.success("✅ Saved to .env file! Future sessions will auto-load.")
-            st.rerun()
-    
-    # MOSS API URL (also from env or default)
-    moss_api_url = os.getenv("MOSS_API_URL", "http://localhost:7860")
-    moss_api_url = st.text_input("MOSS-TTS API URL", value=moss_api_url,
-                                 help="URL where MOSS-TTS is running")
-    
-    # Mock mode for testing
-    use_mock = st.checkbox("🧪 Mock Mode (Test without MOSS)", value=True,
-                          help="Use mock voices for testing when MOSS is not available")
-    
-    if use_mock:
-        st.info("Mock Mode: Using simulated voices for testing")
-    
-    st.markdown("---")
-    
-    # Book stats
-    if st.session_state.chapters:
-        st.markdown(f"<h3>📊 Book Stats</h3>", unsafe_allow_html=True)
-        st.markdown(f"**Chapters:** {len(st.session_state.chapters)}")
-        if st.session_state.generated_files:
-            st.markdown(f"**Generated:** {len(st.session_state.generated_files)} files")
-    
-    st.markdown("---")
-    st.markdown("""
-    <div style='background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 1rem; border-radius: 15px; color: white;'>
-        <h4 style='color: white; margin-top: 0;'>🎯 How it works</h4>
-        <ol style='margin-bottom: 0;'>
-            <li>Upload your PDF book</li>
-            <li>AI analyzes characters & voices</li>
-            <li>MOSS generates unique voices</li>
-            <li>Scene-by-scene narration</li>
-            <li>Download your audiobook</li>
-        </ol>
-    </div>
-    """, unsafe_allow_html=True)
+    model_dir = st.text_input("Model Directory", value="model_assets")
+    st.info("💡 Kokoro model runs entirely locally. No API needed!")
 
-# Main content area
-col1, col2 = st.columns([1, 1])
+# --- MAIN PAGE: HERO ---
+st.markdown("<div class='hero-title'>Emotional Audiobook Agent</div>", unsafe_allow_html=True)
+st.markdown("<p style='color: var(--text-muted); font-size: 1.2rem;'>Transform PDFs into emotionally intelligent audiobooks powered by Kokoro TTS.</p>", unsafe_allow_html=True)
 
-with col1:
-    st.markdown("<h2>📤 1. Upload Your Book</h2>", unsafe_allow_html=True)
-    
-    uploaded_file = st.file_uploader("Choose a PDF file", type=["pdf"], 
-                                     help="Select a text-based PDF book")
-    
-    if uploaded_file and not st.session_state.book_loaded:
-        # Save file temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            st.session_state.file_path = tmp_file.name
-        
-        st.success(f"✅ Uploaded: {uploaded_file.name}")
-        
-        # Load book button
-        if st.button("📖 Load & Analyze Book", use_container_width=True):
-            if not groq_api_key and not use_mock:
-                st.error("Please enter your GROQ API key first or enable Mock Mode!")
-            else:
-                with st.spinner("Loading book and detecting chapters..."):
-                    try:
-                        # Use mock key if in mock mode
-                        actual_api_key = groq_api_key if groq_api_key else "mock_key"
-                        
-                        from orchestrator import AudiobookOrchestrator
-                        
-                        # Initialize orchestrator
-                        st.session_state.orchestrator = AudiobookOrchestrator(
-                            pdf_path=st.session_state.file_path,
-                            groq_api_key=actual_api_key,
-                            moss_api_url=moss_api_url
-                        )
-                        
-                        # Load book
-                        if st.session_state.orchestrator.load_book():
-                            st.session_state.chapters = st.session_state.orchestrator.chapters
-                            st.session_state.book_loaded = True
-                            st.success(f"✅ Found {len(st.session_state.chapters)} chapters")
-                            st.rerun()
-                        else:
-                            st.error("Failed to load book. Please check the PDF format.")
-                    except Exception as e:
-                        st.error(f"Error loading book: {str(e)}")
+if MISSING_DEPS:
+    st.markdown(f"""<div class='diagnostic'><h3>⚠️ Missing Core Dependencies</h3><p>Run: <code>pip install {" ".join(MISSING_DEPS)}</code></p></div>""", unsafe_allow_html=True)
 
-with col2:
-    if st.session_state.chapters:
-        st.markdown("<h2>📚 2. Select Chapters</h2>", unsafe_allow_html=True)
-        
-        total_chapters = len(st.session_state.chapters)
-        
-        # Chapter selection options
-        selection_mode = st.radio(
-            "Selection Mode",
-            ["All Chapters", "Range", "Specific"],
-            horizontal=True
-        )
-        
-        chapter_numbers = []
-        
-        if selection_mode == "All Chapters":
-            chapter_numbers = list(range(1, total_chapters + 1))
-            st.info(f"📚 Will process all {total_chapters} chapters")
-            
-        elif selection_mode == "Range":
-            col_a, col_b = st.columns(2)
-            with col_a:
-                start = st.number_input("Start Chapter", min_value=1, max_value=total_chapters, value=1)
-            with col_b:
-                end = st.number_input("End Chapter", min_value=start, max_value=total_chapters, value=min(10, total_chapters))
-            
-            chapter_numbers = list(range(start, end + 1))
-            st.info(f"📖 Selected chapters: {start} to {end}")
-            
-        else:  # Specific
-            chapter_input = st.text_input("Enter chapter numbers (e.g., 1,3,5-7)", value="1")
-            
-            # Parse input
-            try:
-                numbers = set()
-                parts = chapter_input.replace(' ', '').split(',')
-                for part in parts:
-                    if '-' in part:
-                        s, e = map(int, part.split('-'))
-                        numbers.update(range(s, e + 1))
-                    else:
-                        numbers.add(int(part))
-                
-                chapter_numbers = sorted([n for n in numbers if 1 <= n <= total_chapters])
-                st.info(f"📖 Selected: {', '.join(map(str, chapter_numbers[:10]))}{'...' if len(chapter_numbers) > 10 else ''}")
-            except:
-                st.error("Invalid format. Use: 1,3,5-7")
-                chapter_numbers = []
-        
-        # Show chapter preview
-        with st.expander("📋 Chapter Preview"):
-            for i, chapter in enumerate(st.session_state.chapters[:5]):
-                title = chapter.get('title', f'Chapter {i+1}')
-                preview = chapter.get('content', '')[:100] + "..."
-                st.markdown(f"""
-                <div class="chapter-card">
-                    <strong>{title}</strong><br>
-                    <span style='color: #6b5a48; font-size: 0.9rem;'>{preview}</span>
-                </div>
-                """, unsafe_allow_html=True)
-            if len(st.session_state.chapters) > 5:
-                st.markdown(f"*... and {len(st.session_state.chapters) - 5} more chapters*")
+# --- UI WORKFLOW ---
+col_u, col_s = st.columns([1, 1])
 
-# Progress and generation section
-if st.session_state.chapters and chapter_numbers:
-    st.markdown("---")
-    st.markdown("<h2 style='text-align: center;'>🎬 3. Generate Audiobook</h2>", unsafe_allow_html=True)
-    
-    # Progress display
-    progress_col, status_col = st.columns([3, 1])
-    
-    with progress_col:
-        progress_bar = st.progress(st.session_state.current_progress)
-    with status_col:
-        status_text = st.empty()
-        status_text.info(st.session_state.current_status)
-    
-    # Generate button
-    if st.button("🎬 GENERATE AUDIOBOOK", type="primary", use_container_width=True):
-        if not groq_api_key and not use_mock:
-            st.error("Please enter your GROQ API key first or enable Mock Mode!")
+with col_u:
+    st.markdown("<div class='glass-card'>", unsafe_allow_html=True)
+    st.markdown("<h3>📤 1. Upload Manuscript</h3>", unsafe_allow_html=True)
+    uploaded = st.file_uploader("Drop your PDF book here", type=["pdf"])
+    if uploaded and not st.session_state.book_loaded:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(uploaded.getvalue())
+            st.session_state.file_path = tmp.name
+        if st.button("📖 INITIALIZE STUDIO"):
+            with st.spinner("Analyzing manuscript structure..."):
+                try:
+                    from orchestrator import AudiobookOrchestrator
+                    st.session_state.orchestrator = AudiobookOrchestrator(st.session_state.file_path, groq_api_key, model_dir=model_dir)
+                    if st.session_state.orchestrator.load_book():
+                        st.session_state.chapters = st.session_state.orchestrator.chapters
+                        st.session_state.book_loaded = True
+                        st.rerun()
+                except Exception as e: st.error(f"Error: {e}")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with col_s:
+    st.markdown("<div class='glass-card'>", unsafe_allow_html=True)
+    st.markdown("<h3>📚 2. Select Chapters</h3>", unsafe_allow_html=True)
+    chapter_numbers = []
+    if st.session_state.book_loaded:
+        # Show cache status
+        cache_status = st.session_state.orchestrator.get_cache_status()
+        if cache_status['analysis_from_cache']:
+            st.success(f"📖 Analysis from cache (Fast!)")
+        
+        # Option to clear cache
+        col_ch, col_clr = st.columns([3, 1])
+        with col_clr:
+            if st.button("🔄 Re-Analyze", help="Clear cache and re-analyze the book"):
+                st.session_state.orchestrator.clear_analysis_cache()
+                st.info("Cache cleared! Re-upload to analyze fresh.")
+        
+        mode = col_ch.radio("Selection", ["All", "Range"], horizontal=True)
+        total = len(st.session_state.chapters)
+        if mode == "All": chapter_numbers = list(range(1, total + 1))
         else:
-            try:
-                # Update progress callback
-                def update_progress(progress):
-                    st.session_state.current_progress = progress
-                    progress_bar.progress(progress)
-                
-                def update_status(status):
-                    st.session_state.current_status = status
-                    status_text.info(status)
-                
-                st.session_state.orchestrator.set_progress_callbacks(
-                    update_progress, update_status
-                )
-                
-                # Step 1: Character analysis
-                update_status("🔍 Analyzing characters...")
-                if not st.session_state.orchestrator.analyze_characters():
-                    st.error("Character analysis failed. Please check your API key.")
-                    st.stop()
-                
-                # Step 2: Generate selected chapters
-                update_status("🎭 Generating voices and scenes...")
-                generated = st.session_state.orchestrator.generate_chapters(
-                    chapter_numbers,
-                    use_mock=use_mock
-                )
-                
-                st.session_state.generated_files = generated
-                
-                # Final progress
-                update_progress(1.0)
-                update_status("✅ Complete!")
-                
-                st.success(f"✅ Successfully generated {len(generated)} chapters!")
-                
-                # Show manifest button
-                st.session_state.orchestrator.save_manifest()
-                
-            except Exception as e:
-                st.error(f"Error during generation: {str(e)}")
-                st.exception(e)
-    
-    # Results display
-    if st.session_state.generated_files:
-        st.markdown("---")
-        st.markdown("<h2>📥 4. Download Your Audiobook</h2>", unsafe_allow_html=True)
-        
-        # Find combined file first
-        combined_files = [f for f in st.session_state.generated_files if 'complete' in f or 'chapters' in f]
-        
-        if combined_files:
-            latest_combined = max(combined_files, key=os.path.getctime)
-            
-            st.markdown("### 🎧 Complete Audiobook")
-            with open(latest_combined, "rb") as f:
-                audio_bytes = f.read()
-            
-            st.audio(audio_bytes, format="audio/mp3")
-            
-            col_d1, col_d2, col_d3 = st.columns([1,1,1])
-            with col_d2:
-                st.download_button(
-                    label="📥 Download Complete Audiobook",
-                    data=audio_bytes,
-                    file_name=os.path.basename(latest_combined),
-                    mime="audio/mp3",
-                    use_container_width=True
-                )
-        
-        # Individual chapters
-        st.markdown("### 📚 Individual Chapters")
-        chapter_files = [f for f in st.session_state.generated_files if 'chapter_' in f and f.endswith('.mp3')]
-        
-        # Display in a grid
-        cols = st.columns(3)
-        for i, chapter_file in enumerate(sorted(chapter_files)):
-            with cols[i % 3]:
-                chapter_name = os.path.basename(chapter_file).replace('.mp3', '')
-                with open(chapter_file, "rb") as f:
-                    audio_bytes = f.read()
-                
-                st.audio(audio_bytes, format="audio/mp3")
-                st.download_button(
-                    label=f"Download {chapter_name}",
-                    data=audio_bytes,
-                    file_name=os.path.basename(chapter_file),
-                    mime="audio/mp3",
-                    key=f"download_{i}",
-                    use_container_width=True
-                )
+            c1, c2 = st.columns(2)
+            s_ch = c1.number_input("Start", 1, total, 1)
+            e_ch = c2.number_input("End", s_ch, total, min(10, total))
+            chapter_numbers = list(range(int(s_ch), int(e_ch) + 1))
+    else: st.write("Initialize a book to continue.")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-# Footer
-st.markdown("---")
-st.markdown("""
-<div style='text-align: center; color: #6b5a48; padding: 2rem;'>
-    <p>🎧 Emotional Audiobook Studio | Powered by GROQ Llama 3.3 + MOSS-TTS</p>
-    <p style='font-size: 0.9rem;'>Free and open-source | Create professional audiobooks with AI-generated character voices</p>
-</div>
-""", unsafe_allow_html=True)
+if st.session_state.book_loaded and chapter_numbers:
+    st.markdown("<div class='glass-card'>", unsafe_allow_html=True)
+    st.markdown("<h3 style='text-align: center;'>🎬 3. Synthesize Generative Voices</h3>", unsafe_allow_html=True)
+    st.progress(st.session_state.current_progress)
+    st.markdown(f"<p style='text-align: center; color: var(--primary);'>{st.session_state.current_status}</p>", unsafe_allow_html=True)
+    if st.button("🔥 GENERATE AUDIO"):
+        try:
+            def up_p(p): st.session_state.current_progress = p
+            def up_s(s): st.session_state.current_status = s
+            st.session_state.orchestrator.set_progress_callbacks(up_p, up_s)
+            st.session_state.orchestrator.analyze_characters()
+            generated = st.session_state.orchestrator.generate_chapters(chapter_numbers)
+            st.session_state.generated_files = generated
+            st.rerun()
+        except Exception as e: st.error(f"Synthesis failed: {e}")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-# Instructions expander (moved to bottom)
-# Instructions expander - FIXED for visibility
-with st.expander("📋 How to get started</span>"):
+if st.session_state.generated_files:
+    st.markdown("<div class='glass-card'>", unsafe_allow_html=True)
+    st.markdown("<h3>📥 4. Studio Gallery</h3>", unsafe_allow_html=True)
+    mp3s = [f for f in st.session_state.generated_files if str(f).endswith('.mp3')]
+    grid = st.columns(3)
+    for i, file in enumerate(sorted(mp3s)):
+        with grid[i % 3]:
+            st.markdown(f"**{Path(file).stem}**")
+            with open(file, "rb") as af:
+                st.audio(af.read(), format="audio/mp3")
+                st.download_button("💾 Save", af, file_name=Path(file).name, key=f"dl_{i}")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with st.expander("� Smart Analysis Caching"):
     st.markdown("""
-    "<span style='color: #ff7e5f;'>Detailed instructions below:</span>", unsafe_allow_html=True
-    <div style='background-color: white; padding: 1rem; border-radius: 10px; color: #2c3e50;'>
-        <ol style='color: #2c3e50; margin-bottom: 0; padding-left: 1.5rem;'>
-            <li><strong style='color: #4a3b2f;'>Get a GROQ API key (if not using Mock Mode):</strong>
-                <ul style='margin-top: 0.5rem; margin-bottom: 1rem; color: #2c3e50;'>
-                    <li>Go to <a href='https://console.groq.com' style='color: #ff7e5f; text-decoration: none;'>console.groq.com</a></li>
-                    <li>Sign up for a free account</li>
-                    <li>Get your API key from the API Keys section</li>
-                    <li>Save it in <code style='background: #f0f0f0; color: #e83e8c; padding: 0.2rem 0.4rem; border-radius: 4px;'>.env</code> file for automatic loading</li>
-                </ul>
-            </li>
-            <li><strong style='color: #4a3b2f;'>Set up MOSS-TTS (optional, for real voices):</strong>
-                <ul style='margin-top: 0.5rem; margin-bottom: 1rem; color: #2c3e50;'>
-                    <li>Run <code style='background: #f0f0f0; color: #e83e8c; padding: 0.2rem 0.4rem; border-radius: 4px;'>./deploy_moss.sh</code> to set up locally</li>
-                    <li>Or use a cloud GPU service</li>
-                    <li>Keep <strong style='color: #ff7e5f;'>Mock Mode</strong> enabled to test without MOSS</li>
-                </ul>
-            </li>
-            <li><strong style='color: #4a3b2f;'>Upload your PDF:</strong>
-                <ul style='margin-top: 0.5rem; margin-bottom: 1rem; color: #2c3e50;'>
-                    <li>Make sure it's a text-based PDF (not scanned)</li>
-                    <li>The book should have clear chapter headings</li>
-                </ul>
-            </li>
-            <li><strong style='color: #4a3b2f;'>Wait for processing:</strong>
-                <ul style='margin-top: 0.5rem; margin-bottom: 1rem; color: #2c3e50;'>
-                    <li>Character analysis takes 1-2 minutes</li>
-                    <li>Each chapter takes 2-3 minutes to generate</li>
-                </ul>
-            </li>
-            <li><strong style='color: #4a3b2f;'>Download your audiobook:</strong>
-                <ul style='margin-top: 0.5rem; margin-bottom: 0; color: #2c3e50;'>
-                    <li>You can download individual chapters</li>
-                    <li>Or the complete audiobook as MP3</li>
-                </ul>
-            </li>
-        </ol>
-    </div>
-    """, unsafe_allow_html=True)
+    **How It Works:**
+    - ✅ First upload: Analyzes chapters and characters (may take 1-2 minutes)
+    - ✅ Second upload (same book): Loads cached analysis instantly
+    - ✅ No re-analysis needed: Go straight to audio generation
+    
+    **Cache Features:**
+    - Automatic detection of the same book (using file hash)
+    - One-click "Re-Analyze" button to clear cache if needed
+    - Fast incremental generation for additional chapters
+    """)
+    
+    # Show cache statistics (only if orchestrator exists)
+    if st.session_state.orchestrator:
+        all_cached = st.session_state.orchestrator.get_all_cached_books()
+        if all_cached and all_cached.get('total_cached_books', 0) > 0:
+            st.info(f"📊 **Cached Books:** {all_cached['total_cached_books']}")
+            for book in all_cached.get('cached_books', []):
+                st.text(f"  • {book['name']}: {book['chapters']} chapters, {book['characters']} characters")
+    else:
+        st.caption("Upload a book to see cache statistics")
