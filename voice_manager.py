@@ -1,6 +1,9 @@
 """
-Kokoro Voice Manager - Handles voice generation using Kokoro TTS locally
+Kokoro Voice Manager — Real TTS using the official kokoro pip package (KPipeline).
+All synthesis is done locally; no external API calls.
+Voice .pt files are loaded from model_assets/voices/ by the Kokoro pipeline.
 """
+
 import os
 import json
 import hashlib
@@ -8,360 +11,362 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, Optional, List
 import soundfile as sf
-import torch
-import torchaudio
 import time
 from datetime import datetime
 import warnings
-from utils.model import KokoroModel
-from utils.tts_engine import TTSEngine
+
 warnings.filterwarnings('ignore')
+
 
 class KokoroVoiceManager:
     """
-    Manages voice generation using Kokoro TTS model locally
-    No API calls required - runs entirely on local machine
+    Manages voice generation using the official Kokoro TTS KPipeline.
+    Uses local .pt voice files from model_assets/voices/.
     """
-    
+
     def __init__(self, model_dir: str = "model_assets", device: str = None):
         """
-        Initialize Kokoro Voice Manager
-        
+        Initialize Kokoro Voice Manager.
+
         Args:
-            model_dir: Path to model_assets directory
-            device: 'cuda' or 'cpu' (auto-detected if None)
+            model_dir: Path to model_assets directory (contains voices/).
+            device:    'cuda' or 'cpu' (auto-detected if None). Currently KPipeline
+                       handles device selection internally, so this is informational.
         """
         self.model_dir = Path(model_dir)
         self.voice_cache_dir = Path("voice_cache")
         self.voice_cache_dir.mkdir(exist_ok=True)
-        
-        # Set device
+
+        import torch
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"🎙️ Kokoro Voice Manager initialized (device: {self.device})")
-        
-        # Voice registry stores mapping of character -> voice
+        print(f"🎙️ Kokoro Voice Manager initializing (device: {self.device})")
+
+        # Voice registry: character → voice name
         self.voice_registry_file = self.voice_cache_dir / "voice_registry.json"
         self.voice_registry = self._load_registry()
-        
-        # Load available voices
+
+        # Discover available voices from local .pt files
         self.available_voices = self._load_available_voices()
-        
-        # Initialize Kokoro model
-        self._initialize_kokoro()
-    
+
+        # Initialize the real KPipeline
+        self._pipeline = None
+        self._init_pipeline()
+
+    # ------------------------------------------------------------------
+    # Initialisation helpers
+    # ------------------------------------------------------------------
+
     def _load_registry(self) -> Dict:
-        """Load voice registry from cache"""
+        """Load voice registry from cache."""
         if self.voice_registry_file.exists():
             try:
                 with open(self.voice_registry_file, 'r') as f:
                     return json.load(f)
-            except:
+            except Exception:
                 return {}
         return {}
-    
+
     def _save_registry(self):
-        """Save voice registry to cache"""
+        """Persist voice registry."""
         with open(self.voice_registry_file, 'w') as f:
             json.dump(self.voice_registry, f, indent=2)
-    
+
     def _load_available_voices(self) -> List[str]:
-        """Load list of available voices from model_assets"""
+        """List voice names from model_assets/voices/*.pt files."""
         voices_dir = self.model_dir / "voices"
         if not voices_dir.exists():
-            print(f"⚠️ Voices directory not found at {voices_dir}")
+            print(f"⚠️  Voices directory not found at {voices_dir}")
             return []
-        
-        # Get all .pt voice files
-        voice_files = list(voices_dir.glob("*.pt"))
-        voices = [f.stem for f in voice_files]  # Remove .pt extension
-        
-        print(f"📊 Found {len(voices)} available voices")
-        return sorted(voices)
-    
-    def _initialize_kokoro(self):
-        """Initialize Kokoro TTS model"""
-        try:
-            print("⏳ Loading Kokoro model...")
-            kokoro_path = self.model_dir / "kokoro-v1_0.pth"
-            
-            if not kokoro_path.exists():
-                raise FileNotFoundError(f"Kokoro model not found at {kokoro_path}")
-            
-            # Instantiate the model and load the state dict
-            self.model = KokoroModel()
-            state_dict = torch.load(kokoro_path, map_location=self.device)
-            
-            # This is a workaround. The .pth file is a state dictionary, not a full model object.
-            # We are loading the state dictionary into our placeholder model.
-            # This might fail if the keys in the state_dict do not match the model architecture.
-            # For now, we'll try to load it and catch any errors.
-            try:
-                self.model.load_state_dict(state_dict, strict=False)
-            except RuntimeError as e:
-                print(f"⚠️  Warning: Could not load all keys from state dictionary: {e}")
-                print("     This may be expected if the model architecture is not fully defined.")
 
-            self.model.to(self.device)
-            self.model.eval()
-            
-            print("✅ Kokoro model loaded successfully")
-            
-        except Exception as e:
-            print(f"❌ Failed to initialize Kokoro: {e}")
+        voice_files = list(voices_dir.glob("*.pt"))
+        # Exclude non-voice .pt files (e.g. utility scripts accidentally named .pt)
+        voices = sorted(f.stem for f in voice_files
+                        if len(f.stem) > 2 and '_' in f.stem)
+
+        print(f"📊 Found {len(voices)} available voices")
+        return voices
+
+    def _init_pipeline(self):
+        """Load the real Kokoro KPipeline."""
+        try:
+            from kokoro import KPipeline
+            print("⏳ Loading Kokoro KPipeline…")
+            # lang_code='a' = American English (covers all af_*/am_* voices)
+            self._pipeline = KPipeline(lang_code='a')
+            print("✅ Kokoro KPipeline ready")
+        except ImportError:
+            print("❌ kokoro package not found. Run:  pip install kokoro")
             raise
-    
-    def map_character_to_voice(self, character_name: str, voice_description: str) -> str:
+        except Exception as e:
+            print(f"❌ Failed to load KPipeline: {e}")
+            raise
+
+    # ------------------------------------------------------------------
+    # Voice mapping
+    # ------------------------------------------------------------------
+
+    def map_character_to_voice(self, character_name: str,
+                               voice_description: str) -> str:
         """
-        Map a character to an available voice based on description
-        
+        Map a character to an available voice based on description keywords.
+
         Args:
-            character_name: Name of the character
-            voice_description: Description of desired voice qualities
-            
+            character_name:    Character name.
+            voice_description: Description of desired voice qualities.
+
         Returns:
-            Selected voice name
+            Selected voice name (e.g. 'af_bella').
         """
         if not self.available_voices:
-            print(f"⚠️ No voices available, using default")
-            return "af_bella"  # Fallback voice
-        
-        # Check if already mapped
+            print(f"⚠️  No voices available, using default 'af_bella'")
+            return "af_bella"
+
         cache_key = character_name.lower().replace(' ', '_')
+
+        # Return cached mapping if present
         if cache_key in self.voice_registry:
             voice = self.voice_registry[cache_key].get("selected_voice")
-            print(f"  ✓ Using cached voice for {character_name}: {voice}")
-            return voice
-        
-        # Simple voice selection based on description keywords
+            if voice and voice in self.available_voices:
+                print(f"  ✓ Using cached voice for {character_name}: {voice}")
+                return voice
+
+        # Select by description
         voice = self._select_voice_by_description(voice_description)
-        
-        # Store in registry
+
         self.voice_registry[cache_key] = {
             "character_name": character_name,
             "selected_voice": voice,
             "description": voice_description,
-            "created_at": datetime.now().isoformat()
+            "created_at": datetime.now().isoformat(),
         }
         self._save_registry()
-        
-        print(f"  ✅ Mapped {character_name} to voice: {voice}")
+
+        print(f"  ✅ Mapped {character_name} → {voice}")
         return voice
-    
+
     def _select_voice_by_description(self, description: str) -> str:
-        """
-        Select voice based on description keywords
-        Uses simple heuristics to match voice characteristics
-        """
-        description_lower = description.lower()
-        
-        # Gender detection
-        if any(word in description_lower for word in ['male', 'man', 'boy', 'masculine', 'deep']):
-            male_voices = [v for v in self.available_voices if v.startswith(('am_', 'bm_', 'em_', 'hm_', 'im_', 'jm_', 'pm_', 'zm_'))]
-            if male_voices:
-                return male_voices[0]
+        """Heuristic voice selection based on gender / age keywords."""
+        desc = description.lower()
+
+        is_male = any(w in desc for w in
+                      ['male', 'man', 'boy', 'masculine', 'deep', 'baritone', 'bass'])
+
+        if is_male:
+            # Prefer American male, then British male
+            for prefix in ('am_', 'bm_', 'em_', 'hm_', 'im_', 'jm_', 'pm_', 'zm_'):
+                candidates = [v for v in self.available_voices
+                              if v.startswith(prefix)]
+                if candidates:
+                    return candidates[0]
         else:
-            female_voices = [v for v in self.available_voices if v.startswith(('af_', 'bf_', 'ef_', 'hf_', 'if_', 'jf_', 'pf_', 'zf_'))]
-            if female_voices:
-                return female_voices[0]
-        
-        # Fallback
+            # Prefer American female, then British female
+            for prefix in ('af_', 'bf_', 'ef_', 'hf_', 'if_', 'jf_', 'pf_', 'zf_'):
+                candidates = [v for v in self.available_voices
+                              if v.startswith(prefix)]
+                if candidates:
+                    return candidates[0]
+
         return self.available_voices[0] if self.available_voices else "af_bella"
-    
-    def synthesize_text(self, 
-                       text: str, 
-                       voice: str,
-                       emotion: str = "neutral",
-                       speed: float = 1.0,
-                       output_path: str = None) -> Optional[str]:
+
+    # ------------------------------------------------------------------
+    # Core synthesis
+    # ------------------------------------------------------------------
+
+    def synthesize_text(self,
+                        text: str,
+                        voice: str,
+                        emotion: str = "neutral",
+                        speed: float = 1.0,
+                        output_path: str = None) -> Optional[str]:
         """
-        Synthesize text to speech using Kokoro
-        
+        Synthesize text to speech using the real Kokoro KPipeline.
+
         Args:
-            text: Text to synthesize
-            voice: Voice name (e.g., 'af_bella', 'am_daniel')
-            emotion: Emotion modulation (neutral, happy, sad, angry, etc.)
-            speed: Speaking speed (0.5-2.0)
-            output_path: Optional output file path
-            
+            text:        Text to synthesize.
+            voice:       Voice name (e.g. 'af_bella', 'am_adam').
+            emotion:     Emotion label for speed/pitch adjustments.
+            speed:       Base speaking speed (0.5–2.0).
+            output_path: Where to save the .wav file.
+
         Returns:
-            Path to generated audio file
+            Path to the saved .wav file, or None on failure.
         """
-        try:
-            # Validate voice
-            if voice not in self.available_voices:
-                print(f"⚠️ Voice '{voice}' not found, using fallback")
-                voice = self.available_voices[0] if self.available_voices else "af_bella"
-            
-            # Load voice file
-            voice_path = self.model_dir / "voices" / f"{voice}.pt"
-            if not voice_path.exists():
-                print(f"⚠️ Voice file not found: {voice_path}")
-                return None
-            
-            print(f"  🎵 Synthesizing with voice: {voice}")
-            print(f"     Text length: {len(text)} characters")
-            
-            # Generate output filename if not provided
-            if not output_path:
-                text_hash = hashlib.md5(text.encode()).hexdigest()[:8]
-                output_path = self.voice_cache_dir / f"audio_{voice}_{text_hash}.wav"
-            
-            # Initialize TTS engine if not already done
-            if not hasattr(self, 'tts_engine'):
-                self.tts_engine = TTSEngine(self.model, device=self.device)
-            
-            # Load voice embeddings
-            voice_data = torch.load(voice_path, map_location=self.device)
-            
-            # Perform actual synthesis using TTS engine
-            audio = self.tts_engine.synthesize(
-                text=text,
-                voice_embedding=voice_data,
-                emotion=emotion,
-                speed=speed
+        if not text or not text.strip():
+            return None
+
+        # Validate voice
+        if voice not in self.available_voices:
+            print(f"  ⚠️  Voice '{voice}' not in local list; trying anyway…")
+
+        # Emotion → speed adjustment
+        speed = self._emotion_speed(emotion, speed)
+
+        # Auto output path
+        if not output_path:
+            text_hash = hashlib.md5(text.encode()).hexdigest()[:8]
+            output_path = str(
+                self.voice_cache_dir / f"audio_{voice}_{text_hash}.wav"
             )
-            
-            # Save audio
+
+        print(f"  🎵 Synthesizing | voice={voice} | len={len(text)} chars | "
+              f"emotion={emotion} | speed={speed:.2f}")
+
+        try:
+            audio_chunks = []
+            generator = self._pipeline(text, voice=voice, speed=speed)
+            for _, _, audio in generator:
+                if audio is not None:
+                    # Kokoro might return a torch.Tensor or a numpy array
+                    if hasattr(audio, 'numpy'):
+                        audio_np = audio.detach().cpu().numpy()
+                    else:
+                        audio_np = audio
+                    
+                    if len(audio_np) > 0:
+                        audio_chunks.append(audio_np.astype(np.float32))
+
+            if not audio_chunks:
+                print(f"  ❌ KPipeline produced no audio")
+                return None
+
+            audio_array = np.concatenate(audio_chunks)
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-            sf.write(output_path, audio, 24000)
-            
-            print(f"  ✅ Audio saved: {output_path}")
-            return str(output_path)
-            
+            sf.write(output_path, audio_array, 24000)
+            print(f"  ✅ Saved: {output_path}")
+            return output_path
+
         except Exception as e:
             print(f"  ❌ Synthesis error: {e}")
+            import traceback
+            traceback.print_exc()
             return None
-    
-    def generate_dialogue_scene(self, 
+
+    # ------------------------------------------------------------------
+    # Scene / dialogue helpers
+    # ------------------------------------------------------------------
+
+    def generate_dialogue_scene(self,
                                 scene_data: Dict,
                                 voice_map: Dict[str, str],
                                 output_path: str) -> bool:
         """
-        Generate audio for a complete dialogue scene using Kokoro
-        
+        Generate audio for a complete dialogue scene.
+
         Args:
-            scene_data: Scene data with dialogue turns
-            voice_map: Mapping of character names to voice names
-            output_path: Where to save the audio file
-            
+            scene_data:  Dict with 'narration' and 'dialogue_turns'.
+            voice_map:   Mapping of character names → voice names.
+            output_path: Where to save the combined .wav.
+
         Returns:
-            True if successful
+            True if audio was successfully written.
         """
-        try:
-            print(f"  🎬 Generating scene with {len(scene_data.get('dialogue_turns', []))} lines")
-            
-            # Process each dialogue turn
-            audio_segments = []
-            
-            # Add narration if present
-            if scene_data.get("narration"):
-                narrator_voice = voice_map.get("narrator", "af_alloy")
-                audio_path = self.synthesize_text(
-                    text=scene_data["narration"],
-                    voice=narrator_voice,
-                    emotion="neutral"
+        print(f"  🎬 Scene: {len(scene_data.get('dialogue_turns', []))} lines")
+
+        audio_segments: List[np.ndarray] = []
+
+        # Narration first
+        narration = scene_data.get("narration", "").strip()
+        if narration:
+            narrator_voice = voice_map.get("narrator", "af_bella")
+            if narrator_voice not in self.available_voices:
+                narrator_voice = "af_bella"
+            path = self.synthesize_text(narration, narrator_voice, "neutral")
+            if path:
+                audio, _ = sf.read(path)
+                audio_segments.append(
+                    audio[:, 0] if audio.ndim > 1 else audio
                 )
-                if audio_path:
-                    audio = sf.read(audio_path)[0]
-                    audio_segments.append(audio)
-            
-            # Add dialogue turns
-            for turn in scene_data.get("dialogue_turns", []):
-                speaker = turn.get("speaker", "narrator")
-                text = turn.get("text", "")
-                emotion = turn.get("emotion", "neutral")
-                
-                voice = voice_map.get(speaker)
-                if not voice:
-                    print(f"  ⚠️ No voice for {speaker}, using default")
-                    voice = "af_bella"
-                
-                audio_path = self.synthesize_text(
-                    text=text,
-                    voice=voice,
-                    emotion=emotion
+
+        # Dialogue turns
+        for turn in scene_data.get("dialogue_turns", []):
+            speaker = turn.get("speaker", "narrator")
+            text    = turn.get("text", "").strip()
+            emotion = turn.get("emotion", "neutral")
+
+            if not text:
+                continue
+
+            voice = voice_map.get(speaker)
+            if not voice:
+                # Try case-insensitive lookup
+                for k, v in voice_map.items():
+                    if k.lower() == speaker.lower():
+                        voice = v
+                        break
+            if not voice:
+                print(f"  ⚠️  No voice mapped for '{speaker}', using narrator voice")
+                voice = voice_map.get("narrator", "af_bella")
+
+            path = self.synthesize_text(text, voice, emotion)
+            if path:
+                audio, _ = sf.read(path)
+                audio_segments.append(
+                    audio[:, 0] if audio.ndim > 1 else audio
                 )
-                
-                if audio_path:
-                    audio = sf.read(audio_path)[0]
-                    audio_segments.append(audio)
-            
-            # Concatenate all audio segments
-            if audio_segments:
-                combined_audio = np.concatenate(audio_segments)
-                os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-                sf.write(output_path, combined_audio, 24000)
-                print(f"  ✅ Scene audio saved: {output_path}")
-                return True
-            else:
-                print(f"  ❌ No audio generated")
-                return False
-                
-        except Exception as e:
-            print(f"  ❌ Error generating dialogue: {e}")
+                # Small inter-turn pause (0.3 s)
+                audio_segments.append(
+                    np.zeros(int(0.3 * 24000), dtype=np.float32)
+                )
+
+        if not audio_segments:
+            print(f"  ❌ No audio generated for scene")
             return False
-    
-    def generate_emotion_variant(self, 
+
+        combined = np.concatenate(audio_segments).astype(np.float32)
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        sf.write(output_path, combined, 24000)
+        print(f"  ✅ Scene saved: {output_path}")
+        return True
+
+    def generate_emotion_variant(self,
                                  voice: str,
                                  text: str,
                                  emotion: str,
                                  modulation: Dict = None,
                                  output_path: str = None) -> Optional[str]:
-        """
-        Generate audio with specific emotion modulation
-        
-        Args:
-            voice: Voice name
-            text: Text to synthesize
-            emotion: Emotion type
-            modulation: Optional modulation parameters
-            output_path: Output file path
-            
-        Returns:
-            Path to generated audio file
-        """
-        # Apply modulation to synthesis parameters
+        """Generate audio with emotion modulation."""
         speed = 1.0
         if modulation:
-            if emotion == "sad":
-                speed = 0.85
-            elif emotion == "happy":
-                speed = 1.15
-            elif emotion == "angry":
-                speed = 1.1
-        
-        return self.synthesize_text(
-            text=text,
-            voice=voice,
-            emotion=emotion,
-            speed=speed,
-            output_path=output_path
-        )
-    
+            speed = modulation.get("speed_multiplier", 1.0)
+        return self.synthesize_text(text, voice, emotion, speed, output_path)
+
+    # ------------------------------------------------------------------
+    # Utility
+    # ------------------------------------------------------------------
+
+    def _emotion_speed(self, emotion: str, base: float) -> float:
+        mods = {
+            'sad': 0.88, 
+            'happy': 1.12, 
+            'angry': 1.15,
+            'excited': 1.25, 
+            'calm': 0.90, 
+            'neutral': 1.00,
+            'whispering': 0.70,
+            'screaming': 1.40,
+            'crying': 0.80,
+            'shouting': 1.30,
+            'urgent': 1.20,
+            'soft': 0.85
+        }
+        return round(base * mods.get(emotion.lower(), 1.00), 2)
+
     def get_voice_info(self) -> Dict:
-        """Get information about available voices"""
         return {
             "available_voices": self.available_voices,
             "total_voices": len(self.available_voices),
             "device": self.device,
-            "model": "Kokoro-82M"
+            "model": "Kokoro-82M (KPipeline)",
         }
-    
+
     def list_voices(self, filter_gender: str = None) -> List[str]:
-        """
-        List available voices with optional gender filter
-        
-        Args:
-            filter_gender: 'male' or 'female' or None
-            
-        Returns:
-            List of voice names
-        """
-        voices = self.available_voices
-        
+        male_prefixes   = ('am_', 'bm_', 'em_', 'hm_', 'im_', 'jm_', 'pm_', 'zm_')
+        female_prefixes = ('af_', 'bf_', 'ef_', 'hf_', 'if_', 'jf_', 'pf_', 'zf_')
+
         if filter_gender == "male":
-            voices = [v for v in voices if any(v.startswith(p) for p in ('am_', 'bm_', 'em_', 'hm_', 'im_', 'jm_', 'pm_', 'zm_'))]
-        elif filter_gender == "female":
-            voices = [v for v in voices if any(v.startswith(p) for p in ('af_', 'bf_', 'ef_', 'hf_', 'if_', 'jf_', 'pf_', 'zf_'))]
-        
-        return voices
+            return [v for v in self.available_voices
+                    if any(v.startswith(p) for p in male_prefixes)]
+        if filter_gender == "female":
+            return [v for v in self.available_voices
+                    if any(v.startswith(p) for p in female_prefixes)]
+        return list(self.available_voices)

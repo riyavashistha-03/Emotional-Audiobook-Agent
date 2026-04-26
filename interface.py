@@ -6,7 +6,15 @@ from pathlib import Path
 import time
 import json
 import glob
+import warnings
+import logging
 from dotenv import load_dotenv
+
+# Suppress noisy library warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", message="Accessing __path__ from")
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 # --- SYSTEM DIAGNOSTICS & SHIELD ---
 MISSING_DEPS = []
@@ -31,81 +39,143 @@ if 'orchestrator' not in st.session_state:
     st.session_state.orchestrator = None
 if 'chapters' not in st.session_state:
     st.session_state.chapters = []
-if 'book_loaded' not in st.session_state:
-    st.session_state.book_loaded = False
-if 'current_progress' not in st.session_state:
-    st.session_state.current_progress = 0
-if 'current_status' not in st.session_state:
-    st.session_state.current_status = "Waiting for upload..."
-if 'generated_files' not in st.session_state:
-    st.session_state.generated_files = []
-
+if 'book_loaded' not in st.session_state: st.session_state.book_loaded = False
+if 'chapter_selection_done' not in st.session_state: st.session_state.chapter_selection_done = False
+if 'selected_chapters' not in st.session_state: st.session_state.selected_chapters = []
+if 'analysis_started' not in st.session_state: st.session_state.analysis_started = False
+if 'characters_analysed' not in st.session_state: st.session_state.characters_analysed = False
+if 'generation_started' not in st.session_state: st.session_state.generation_started = False
+if 'generated_files' not in st.session_state: st.session_state.generated_files = []
+if 'current_progress' not in st.session_state: st.session_state.current_progress = 0
+if 'current_status' not in st.session_state: st.session_state.current_status = "Waiting..."
 # Page Configuration
-st.set_page_config(
-    page_title="Emotional Audiobook Agent | Kokoro Studio",
-    page_icon="🎧",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="BooksTalk", page_icon="🎧", layout="wide", initial_sidebar_state="expanded")
 
-# --- OBSIDIAN RESONANCE DESIGN SYSTEM ---
+# --- BOOKSTALK: MIDNIGHT BLOOM + AURORA NEBULA ---
 st.markdown("""
-<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;800&family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-    :root {
-        --bg: #0b1326;
-        --surface: #131b2e;
-        --surface-high: #222a3d;
-        --primary: #8B5CF6;
-        --primary-glow: rgba(139, 92, 246, 0.4);
-        --text: #dae2fd;
-        --text-muted: #958ea0;
-        --glass: rgba(45, 52, 73, 0.4);
-        --glass-border: rgba(255, 255, 255, 0.1);
-        --radius: 1.5rem;
-    }
-    .stApp { background-color: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; }
-    h1, h2, h3 { font-family: 'Manrope', sans-serif !important; font-weight: 800 !important; color: white !important; }
-    .hero-title { font-size: 3.5rem; margin-bottom: 0.5rem; background: linear-gradient(135deg, white 0%, var(--primary) 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-    .glass-card { background: var(--glass); backdrop-filter: blur(12px); border: 1px solid var(--glass-border); border-radius: var(--radius); padding: 2.5rem; margin-bottom: 2rem; }
-    .stButton > button { background: linear-gradient(135deg, var(--primary) 0%, #6d3bd7 100%); color: white !important; border-radius: 50px !important; letter-spacing: 0.1rem; box-shadow: 0 4px 15px var(--primary-glow) !important; width: 100%; transition: all 0.3s ease; }
-    .stButton > button:hover { transform: translateY(-3px); box-shadow: 0 8px 25px var(--primary-glow) !important; }
-    .diagnostic { background: rgba(255, 107, 107, 0.1); border: 1px solid #ff6b6b; padding: 1.5rem; border-radius: var(--radius); margin-bottom: 2rem; }
+* { font-family: 'Inter', sans-serif !important; }
+.stApp { background-color: #080d1a !important; color: #f0f4ff; }
+.stApp::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 700px 320px at 55% 0%, rgba(192,38,211,0.11) 0%, transparent 70%),
+    radial-gradient(ellipse 500px 260px at 100% 30%, rgba(56,189,248,0.07) 0%, transparent 70%),
+    radial-gradient(ellipse 420px 200px at 50% 90%, rgba(240,18,122,0.06) 0%, transparent 70%);
+  pointer-events: none;
+  z-index: 0;
+}
+section[data-testid="stSidebar"] { background-color: #060a14 !important; border-right: 1px solid rgba(255,255,255,0.06) !important; }
+.stButton > button {
+  background: #f0127a !important; color: #fff !important; border: none !important;
+  border-radius: 50px !important; padding: 12px 32px !important;
+  font-size: 14px !important; font-weight: 600 !important; letter-spacing: 0.02em !important;
+  width: auto !important; transition: opacity 0.2s;
+}
+.stButton > button:hover { opacity: 0.88; }
+.bt-card { background: rgba(10,14,30,0.70); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 18px 16px; margin-bottom: 12px; }
+.bt-section-label { font-size: 11px; letter-spacing: 0.14em; color: #5a6a90; text-transform: uppercase; margin-bottom: 6px; }
+.wbar { width: 4px; background: #f0127a; border-radius: 2px; animation: wbpulse 0.8s ease-in-out infinite alternate; }
+@keyframes wbpulse { from { height: 6px; } to { height: 28px; } }
 </style>
 """, unsafe_allow_html=True)
 
-# --- SIDEBAR: CONFIGURATION ---
+# --- SIDEBAR ---
 with st.sidebar:
-    st.markdown("<h2 style='color: white;'>⚙️ Configuration</h2>", unsafe_allow_html=True)
+    st.markdown("""
+    <div style='padding:16px 4px 20px;'>
+      <span style='font-size:20px;font-weight:700;color:#f0f4ff;'>Books</span><span style='font-size:20px;font-weight:700;color:#f0127a;'>Talk</span>
+    </div>
+    <div style='font-size:10px;letter-spacing:0.12em;color:#3a4460;text-transform:uppercase;padding:0 4px 6px;'>Workspace</div>
+    """, unsafe_allow_html=True)
+    for label in ["New Project", "My Library", "Export History"]:
+        is_active = label == "New Project"
+        bg = "rgba(240,18,122,0.10)" if is_active else "transparent"
+        clr = "#f0127a" if is_active else "#5a6a90"
+        bl = "2px solid #f0127a" if is_active else "2px solid transparent"
+        st.markdown(f"<div style='font-size:13px;color:{clr};background:{bg};padding:9px 12px;border-radius:8px;border-left:{bl};margin-bottom:3px;cursor:pointer;'>{label}</div>", unsafe_allow_html=True)
+    st.markdown("<div style='font-size:10px;letter-spacing:0.12em;color:#3a4460;text-transform:uppercase;padding:14px 4px 6px;'>Settings</div>", unsafe_allow_html=True)
+    for label in ["Voice Profiles", "API Keys"]:
+        st.markdown(f"<div style='font-size:13px;color:#5a6a90;padding:9px 12px;border-radius:8px;margin-bottom:3px;cursor:pointer;'>{label}</div>", unsafe_allow_html=True)
+    st.markdown("<div style='margin:10px 0;'></div>", unsafe_allow_html=True)
     groq_api_key = os.getenv("GROQ_API_KEY", "")
-    if not groq_api_key:
-        groq_api_key = st.text_input("GROQ API Key", type="password")
+    if groq_api_key:
+        st.markdown("""<div style='padding:10px 12px;background:rgba(10,18,10,0.7);border-radius:8px;border:1px solid #1a2e1a;font-size:11px;color:#4a8a40;'><span style='display:inline-block;width:6px;height:6px;border-radius:50%;background:#22c55e;margin-right:6px;'></span>Groq API connected</div>""", unsafe_allow_html=True)
     else:
-        st.success("✅ GROQ API Key Active")
-    
+        groq_api_key = st.text_input("GROQ API Key", type="password")
+    st.markdown("<div style='margin:8px 0;'></div>", unsafe_allow_html=True)
     model_dir = st.text_input("Model Directory", value="model_assets")
-    st.info("💡 Kokoro model runs entirely locally. No API needed!")
+    
+    st.markdown("<div style='margin-top:20px; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 20px;'></div>", unsafe_allow_html=True)
+    reset_trigger = st.button("🗑️ Clear All Cache & Reset")
+    if reset_trigger:
+        # Clear directories
+        for d in ["analysis_cache", "voice_cache", "audiobook_output"]:
+            if os.path.exists(d):
+                for f in os.listdir(d):
+                    try: os.remove(os.path.join(d, f))
+                    except: pass
+        
+        # Clear session state
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+            
+        st.success("All cache cleared! Restarting...")
+        time.sleep(1)
+        st.rerun()
 
-# --- MAIN PAGE: HERO ---
-st.markdown("<div class='hero-title'>Emotional Audiobook Agent</div>", unsafe_allow_html=True)
-st.markdown("<p style='color: var(--text-muted); font-size: 1.2rem;'>Transform PDFs into emotionally intelligent audiobooks powered by Kokoro TTS.</p>", unsafe_allow_html=True)
-
+# --- MISSING DEPS BANNER ---
 if MISSING_DEPS:
-    st.markdown(f"""<div class='diagnostic'><h3>⚠️ Missing Core Dependencies</h3><p>Run: <code>pip install {" ".join(MISSING_DEPS)}</code></p></div>""", unsafe_allow_html=True)
+    st.markdown(f"""<div style='background:rgba(240,18,122,0.08);border:1px solid rgba(240,18,122,0.3);border-radius:10px;padding:14px 18px;margin-bottom:20px;font-size:13px;color:#f0127a;'>⚠ Missing dependencies — run: <code style='background:rgba(0,0,0,0.3);padding:2px 6px;border-radius:4px;'>pip install {" ".join(MISSING_DEPS)}</code></div>""", unsafe_allow_html=True)
 
-# --- UI WORKFLOW ---
-col_u, col_s = st.columns([1, 1])
+# --- STEPPER ---
+def _step_html(steps, active):
+    parts = []
+    for i, label in enumerate(steps):
+        n = i + 1
+        done = n < active
+        curr = n == active
+        if done:
+            circ = f"<div style='width:28px;height:28px;border-radius:50%;background:#f0127a;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#fff;flex-shrink:0;'>{n}</div>"
+            lclr = "#f0127a"
+        elif curr:
+            circ = f"<div style='width:28px;height:28px;border-radius:50%;border:2px solid #f0127a;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#f0127a;flex-shrink:0;'>{n}</div>"
+            lclr = "#f0f4ff"
+        else:
+            circ = f"<div style='width:28px;height:28px;border-radius:50%;border:2px solid #1e2540;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#2a3450;flex-shrink:0;'>{n}</div>"
+            lclr = "#2a3450"
+        parts.append(f"<div style='display:flex;flex-direction:column;align-items:center;gap:6px;'>{circ}<span style='font-size:10px;color:{lclr};white-space:nowrap;'>{label}</span></div>")
+        if i < len(steps)-1:
+            lc = "#f0127a" if done else "#1e2540"
+            parts.append(f"<div style='flex:1;height:2px;background:{lc};margin-bottom:14px;'></div>")
+    return "<div style='display:flex;align-items:center;gap:8px;padding:24px 0 28px;'>" + "".join(parts) + "</div>"
 
-with col_u:
-    st.markdown("<div class='glass-card'>", unsafe_allow_html=True)
-    st.markdown("<h3>📤 1. Upload Manuscript</h3>", unsafe_allow_html=True)
-    uploaded = st.file_uploader("Drop your PDF book here", type=["pdf"])
-    if uploaded and not st.session_state.book_loaded:
+_steps = ["Upload","Chapters","Analyse","Characters","Generate","Listen"]
+if not st.session_state.book_loaded: _active = 1
+elif not st.session_state.get('chapter_selection_done'): _active = 2
+elif not st.session_state.get('analysis_started'): _active = 3
+elif not st.session_state.characters_analysed: _active = 4
+elif not st.session_state.generated_files: _active = 5
+else: _active = 6
+st.markdown(_step_html(_steps, _active), unsafe_allow_html=True)
+
+# --- STEP 1: UPLOAD ---
+if not st.session_state.book_loaded:
+    st.markdown("""<div style='font-size:11px;letter-spacing:0.14em;color:#5a4a70;text-transform:uppercase;margin-bottom:8px;'>New project — step 1 of 5</div>
+<div style='font-size:26px;font-weight:700;letter-spacing:-0.02em;color:#f0f4ff;margin-bottom:6px;'>Upload your manuscript</div>
+<div style='font-size:14px;color:#5a6a90;margin-bottom:24px;'>Drop a PDF and we'll detect characters, assign voices, and craft your audiobook.</div>""", unsafe_allow_html=True)
+    uploaded = st.file_uploader("PDF manuscript", type=["pdf"], label_visibility="collapsed")
+    if uploaded:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(uploaded.getvalue())
             st.session_state.file_path = tmp.name
-        if st.button("📖 INITIALIZE STUDIO"):
-            with st.spinner("Analyzing manuscript structure..."):
+        sz = f"{len(uploaded.getvalue())//1024} KB"
+        st.markdown(f"""<div style='background:rgba(12,17,40,0.8);border:1px solid rgba(240,18,122,0.2);border-radius:10px;padding:12px 16px;display:flex;align-items:center;gap:12px;margin-bottom:22px;'><div style='width:7px;height:7px;border-radius:50%;background:#f0127a;flex-shrink:0;'></div><div><div style='font-size:13px;color:#e2e8f8;font-weight:500;'>{uploaded.name}</div><div style='font-size:11px;color:#3a4460;'>{sz} · PDF · Ready</div></div></div>""", unsafe_allow_html=True)
+        if st.button("Analyse manuscript"):
+            with st.spinner("Analysing manuscript structure…"):
                 try:
                     from orchestrator import AudiobookOrchestrator
                     st.session_state.orchestrator = AudiobookOrchestrator(st.session_state.file_path, groq_api_key, model_dir=model_dir)
@@ -114,67 +184,172 @@ with col_u:
                         st.session_state.book_loaded = True
                         st.rerun()
                 except Exception as e: st.error(f"Error: {e}")
-    st.markdown("</div>", unsafe_allow_html=True)
 
-with col_s:
-    st.markdown("<div class='glass-card'>", unsafe_allow_html=True)
-    st.markdown("<h3>📚 2. Select Chapters</h3>", unsafe_allow_html=True)
-    chapter_numbers = []
-    if st.session_state.book_loaded:
-        # Show cache status
+# --- STEP 2: SELECT CHAPTERS ---
+if st.session_state.book_loaded and not st.session_state.get('chapter_selection_done'):
+    st.markdown("<div style='font-size:26px;font-weight:700;color:#f0f4ff;margin-bottom:16px;'>Select chapters</div>", unsafe_allow_html=True)
+    if st.session_state.orchestrator:
         cache_status = st.session_state.orchestrator.get_cache_status()
-        if cache_status['analysis_from_cache']:
-            st.success(f"📖 Analysis from cache (Fast!)")
+        if cache_status.get('analysis_from_cache'):
+            st.markdown("<div style='font-size:12px;color:#4a8a40;margin-bottom:12px;'>⚡ Analysis loaded from cache</div>", unsafe_allow_html=True)
+    
+    total = len(st.session_state.chapters)
+    col_sel1, col_sel2 = st.columns([1, 1])
+    with col_sel1:
+        select_all = st.button("Select All")
+    with col_sel2:
+        deselect_all = st.button("Deselect All")
         
-        # Option to clear cache
-        col_ch, col_clr = st.columns([3, 1])
-        with col_clr:
-            if st.button("🔄 Re-Analyze", help="Clear cache and re-analyze the book"):
-                st.session_state.orchestrator.clear_analysis_cache()
-                st.info("Cache cleared! Re-upload to analyze fresh.")
-        
-        mode = col_ch.radio("Selection", ["All", "Range"], horizontal=True)
-        total = len(st.session_state.chapters)
-        if mode == "All": chapter_numbers = list(range(1, total + 1))
+    if select_all: st.session_state.selected_temp = list(range(1, total + 1))
+    if deselect_all: st.session_state.selected_temp = []
+    
+    if 'selected_temp' not in st.session_state:
+        st.session_state.selected_temp = []
+
+    # Scrollable container for chapters
+    selected = []
+    st.markdown('<div style="max-height: 400px; overflow-y: auto; background: rgba(0,0,0,0.2); padding: 15px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.05);">', unsafe_allow_html=True)
+    for i, ch in enumerate(st.session_state.chapters, 1):
+        title = ch.get('title', f"Chapter {i}")
+        is_checked = i in st.session_state.selected_temp
+        chk = st.checkbox(f"{i}. {title}", value=is_checked, key=f"chk_{i}")
+        if chk: selected.append(i)
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    st.session_state.selected_temp = selected
+    
+    st.markdown("<div style='margin-top:20px;'></div>", unsafe_allow_html=True)
+    if st.button("Confirm Selection →"):
+        if not selected:
+            st.warning("Please select at least one chapter.")
         else:
-            c1, c2 = st.columns(2)
-            s_ch = c1.number_input("Start", 1, total, 1)
-            e_ch = c2.number_input("End", s_ch, total, min(10, total))
-            chapter_numbers = list(range(int(s_ch), int(e_ch) + 1))
-    else: st.write("Initialize a book to continue.")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-if st.session_state.book_loaded and chapter_numbers:
-    st.markdown("<div class='glass-card'>", unsafe_allow_html=True)
-    st.markdown("<h3 style='text-align: center;'>🎬 3. Synthesize Generative Voices</h3>", unsafe_allow_html=True)
-    st.progress(st.session_state.current_progress)
-    st.markdown(f"<p style='text-align: center; color: var(--primary);'>{st.session_state.current_status}</p>", unsafe_allow_html=True)
-    if st.button("🔥 GENERATE AUDIO"):
-        try:
-            def up_p(p): st.session_state.current_progress = p
-            def up_s(s): st.session_state.current_status = s
-            st.session_state.orchestrator.set_progress_callbacks(up_p, up_s)
-            st.session_state.orchestrator.analyze_characters()
-            generated = st.session_state.orchestrator.generate_chapters(chapter_numbers)
-            st.session_state.generated_files = generated
+            st.session_state.selected_chapters = selected
+            st.session_state.chapter_selection_done = True
             st.rerun()
-        except Exception as e: st.error(f"Synthesis failed: {e}")
-    st.markdown("</div>", unsafe_allow_html=True)
 
+# --- STEP 3: ANALYSE SELECTION ---
+if st.session_state.get('chapter_selection_done') and not st.session_state.get('analysis_started'):
+    st.markdown("<div style='font-size:26px;font-weight:700;color:#f0f4ff;margin-bottom:6px;'>Analysing selection...</div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='font-size:14px;color:#5a6a90;margin-bottom:24px;'>We are identifying characters and mapping voices for Chapters: {st.session_state.selected_chapters}</div>", unsafe_allow_html=True)
+    
+    if st.button("Start Deep Analysis"):
+        # Pre-check text length
+        selected_text = ""
+        for num in st.session_state.selected_chapters:
+            idx = num - 1
+            if 0 <= idx < len(st.session_state.chapters):
+                selected_text += st.session_state.chapters[idx].get('content', '')
+        
+        if len(selected_text.strip()) < 10:
+            st.error("❌ No text could be extracted from these chapters. Is your PDF image-only (scanned)?")
+            st.info("Try selecting different chapters or a different PDF.")
+        else:
+            st.session_state.analysis_started = True
+            with st.status("Performing deep analysis...", expanded=True) as status:
+                def up_p(p): st.session_state.current_progress = p
+                def up_s(s): st.session_state.current_status = s
+                st.session_state.orchestrator.set_progress_callbacks(up_p, up_s)
+                
+                if st.session_state.orchestrator.analyze_characters_for_selection(st.session_state.selected_chapters):
+                    st.session_state.characters_analysed = True
+                    status.update(label="Analysis complete!", state="complete")
+                    st.rerun()
+                else:
+                    st.error("Analysis failed. Check logs.")
+                    st.session_state.analysis_started = False
+    
+    if st.button("← Back to Chapters"):
+        st.session_state.chapter_selection_done = False
+        st.rerun()
+
+# --- STEP 4: CHARACTERS ---
+if st.session_state.characters_analysed and not st.session_state.get('generation_started'):
+    st.markdown("<div style='font-size:26px;font-weight:700;color:#f0f4ff;margin-bottom:6px;'>Characters in Selection</div>", unsafe_allow_html=True)
+    st.markdown("<div style='font-size:14px;color:#5a6a90;margin-bottom:24px;'>Verify the voices assigned to each character.</div>", unsafe_allow_html=True)
+    
+    registry = st.session_state.orchestrator.character_registry
+    voice_map = st.session_state.orchestrator.voice_map
+    
+    cols3 = st.columns(3)
+    for idx, (name, data) in enumerate(registry.items()):
+        voice_name = voice_map.get(name, "Unknown")
+        with cols3[idx % 3]:
+            st.markdown(f"""
+            <div class='bt-card'>
+                <div style='font-size:16px;color:#f0f4ff;font-weight:700;margin-bottom:4px;'>{name}</div>
+                <div style='font-size:10px;color:#f0127a;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:8px;'>{voice_name}</div>
+                <div style='font-size:12px;color:#5a6a90;'>{data.get('personality', 'No description')}</div>
+            </div>
+            """, unsafe_allow_html=True)
+    
+    col_btns = st.columns([1, 4])
+    with col_btns[0]:
+        if st.button("← Back"):
+            st.session_state.analysis_started = False
+            st.session_state.characters_analysed = False
+            st.rerun()
+    with col_btns[1]:
+        if st.button("Generate Audiobook →"):
+            st.session_state.generation_started = True
+            st.rerun()
+
+# --- STEP 5: GENERATE ---
+if st.session_state.get('generation_started') and not st.session_state.generated_files:
+    st.markdown("<div style='font-size:26px;font-weight:700;color:#f0f4ff;margin-bottom:6px;'>Generating Audio...</div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='font-size:13px;color:#f0127a;margin-bottom:8px;'>{st.session_state.current_status}</div>", unsafe_allow_html=True)
+    st.progress(st.session_state.current_progress)
+    st.markdown("""<div style='display:flex;align-items:flex-end;gap:3px;height:32px;margin:16px 0;'><div class='wbar' style='animation-delay:0s'></div><div class='wbar' style='animation-delay:0.1s'></div><div class='wbar' style='animation-delay:0.2s'></div><div class='wbar' style='animation-delay:0.3s'></div><div class='wbar' style='animation-delay:0.4s'></div></div>""", unsafe_allow_html=True)
+    
+    # Auto-trigger generation
+    try:
+        def up_p(p): st.session_state.current_progress = p
+        def up_s(s): st.session_state.current_status = s
+        st.session_state.orchestrator.set_progress_callbacks(up_p, up_s)
+        generated = st.session_state.orchestrator.generate_chapters(st.session_state.selected_chapters)
+        st.session_state.generated_files = generated
+        st.rerun()
+    except Exception as e:
+        st.error(f"Synthesis failed: {e}")
+        st.session_state.generation_started = False
+    
+    if st.button("← Stop & Go Back"):
+        st.session_state.generation_started = False
+        st.rerun()
+
+# --- STEP 5: GALLERY ---
 if st.session_state.generated_files:
-    st.markdown("<div class='glass-card'>", unsafe_allow_html=True)
-    st.markdown("<h3>📥 4. Studio Gallery</h3>", unsafe_allow_html=True)
-    mp3s = [f for f in st.session_state.generated_files if str(f).endswith('.mp3')]
-    grid = st.columns(3)
-    for i, file in enumerate(sorted(mp3s)):
-        with grid[i % 3]:
-            st.markdown(f"**{Path(file).stem}**")
-            with open(file, "rb") as af:
-                st.audio(af.read(), format="audio/mp3")
-                st.download_button("💾 Save", af, file_name=Path(file).name, key=f"dl_{i}")
-    st.markdown("</div>", unsafe_allow_html=True)
+    audio_files = [f for f in st.session_state.generated_files if str(f).endswith('.mp3') or str(f).endswith('.wav')]
+    voices_used = len(set(Path(f).stem.split('_')[0] for f in audio_files)) if audio_files else 0
+    total_chapters = len(audio_files)
+    st.markdown(f"""<div style='display:flex;gap:12px;margin-bottom:26px;'><div style='background:rgba(10,14,30,0.7);border:1px solid rgba(255,255,255,0.07);border-radius:10px;padding:14px 20px;flex:1;'><div style='font-size:22px;font-weight:700;color:#f0127a;'>{total_chapters}</div><div style='font-size:10px;color:#3a4460;letter-spacing:0.1em;text-transform:uppercase;'>Chapters</div></div><div style='background:rgba(10,14,30,0.7);border:1px solid rgba(255,255,255,0.07);border-radius:10px;padding:14px 20px;flex:1;'><div style='font-size:22px;font-weight:700;color:#f0127a;'>{voices_used}</div><div style='font-size:10px;color:#3a4460;letter-spacing:0.1em;text-transform:uppercase;'>Voices Used</div></div><div style='background:rgba(10,14,30,0.7);border:1px solid rgba(255,255,255,0.07);border-radius:10px;padding:14px 20px;flex:1;'><div style='font-size:22px;font-weight:700;color:#f0127a;'>✓</div><div style='font-size:10px;color:#3a4460;letter-spacing:0.1em;text-transform:uppercase;'>Ready</div></div></div>""", unsafe_allow_html=True)
+    if not audio_files:
+        st.warning("No audio files generated yet.")
+    for i, file in enumerate(sorted(audio_files)):
+        stem = Path(file).stem
+        fmt = "audio/mp3" if str(file).endswith('.mp3') else "audio/wav"
+        _bar_parts = []
+        for j in range(10):
+            _clr = "#f0127a" if j % 2 == 0 else "rgba(240,18,122,0.2)"
+            _ht = 8 + ((j * 7) % 16)
+            _bar_parts.append(f"<div style='width:3px;background:{_clr};border-radius:2px;height:{_ht}px;'></div>")
+        bars = "".join(_bar_parts)
+        st.markdown(f"""<div style='background:rgba(10,14,30,0.65);border:1px solid rgba(255,255,255,0.06);border-radius:12px;padding:16px 20px;display:flex;align-items:center;gap:14px;margin-bottom:10px;'><span style='font-size:11px;color:#3a4460;width:64px;'>Chapter {i+1}</span><span style='font-size:14px;color:#c8d4f0;font-weight:500;flex:1;'>{stem}</span><div style='display:flex;align-items:flex-end;gap:2px;'>{bars}</div><span style='font-size:11px;color:#3a4460;width:40px;text-align:right;'>--:--</span></div>""", unsafe_allow_html=True)
+        with open(file, "rb") as af:
+            data = af.read()
+            c1, c2 = st.columns([1,1])
+            with c1: st.audio(data, format=fmt)
+            with c2: st.download_button("↓ Save", data, file_name=Path(file).name, key=f"dl_{i}")
+    
+    st.markdown("<div style='margin-top:32px;'></div>", unsafe_allow_html=True)
+    if st.button("➕ Add More Chapters / Modify Selection"):
+        st.session_state.chapter_selection_done = False
+        st.session_state.analysis_started = False
+        st.session_state.characters_analysed = False
+        st.session_state.generation_started = False
+        st.session_state.generated_files = []
+        st.rerun()
 
-with st.expander("� Smart Analysis Caching"):
+with st.expander("⚡ Smart Analysis Caching"):
     st.markdown("""
     **How It Works:**
     - ✅ First upload: Analyzes chapters and characters (may take 1-2 minutes)

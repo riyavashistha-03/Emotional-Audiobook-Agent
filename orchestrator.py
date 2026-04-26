@@ -99,64 +99,49 @@ class AudiobookOrchestrator:
             print(f"❌ Error loading book: {e}")
             return False
     
-    def analyze_characters(self) -> bool:
-        """Analyze all characters in the book"""
+    def analyze_characters_for_selection(self, chapter_numbers: List[int]) -> bool:
+        """Analyze characters found only in the selected chapters"""
         try:
-            # Skip analysis if it was already loaded from cache
-            if self.analysis_from_cache:
-                self._update_progress(0.8, "✅ Using cached character analysis")
-                return True
+            selected_text = ""
+            for num in chapter_numbers:
+                idx = num - 1
+                if 0 <= idx < len(self.chapters):
+                    selected_text += self.chapters[idx].get('content', '') + "\n\n"
             
-            self._update_progress(0.4, "Analyzing characters (this may take a moment)...")
-            self.character_registry = self.character_designer.analyze_full_book_characters(
-                self.full_text
-            )
+            if not selected_text or len(selected_text.strip()) < 50:
+                print(f"⚠️ Text extraction returned very little content ({len(selected_text)} chars). This usually means the PDF is image-based or chapter detection missed the text.")
+                # We won't fail here, but the AI might hallucinate if text is empty
+                
+            self._update_progress(0.4, "Analyzing characters in selected chapters...")
+            print(f"📡 Sending {len(selected_text)} characters of text to LLM for analysis...")
+            self.character_registry = self.character_designer.analyze_characters_in_text(selected_text)
             
-            self._update_progress(0.5, "Generating voice design briefs...")
+            self._update_progress(0.6, "Designing voices for found characters...")
             voice_briefs = self.character_designer.generate_voice_design_briefs()
             
-            self._update_progress(0.6, "Mapping characters to Kokoro voices...")
+            self._update_progress(0.7, "Mapping voices...")
+            for char_name, brief in voice_briefs.items():
+                voice = self.voice_manager.map_character_to_voice(char_name, brief)
+                if voice:
+                    self.voice_map[char_name] = voice
             
-            # Map characters to available Kokoro voices
-            total_chars = len(self.character_registry)
-            for i, (char_name, _) in enumerate(self.character_registry.items()):
-                if char_name in voice_briefs:
-                    voice = self.voice_manager.map_character_to_voice(
-                        char_name,
-                        voice_briefs[char_name]
-                    )
-                    if voice:
-                        self.voice_map[char_name] = voice
-                
-                # Update progress
-                progress = 0.6 + (0.2 * (i + 1) / total_chars)
-                self._update_progress(progress, f"Mapped voice for: {char_name}")
-            
-            # Always add a narrator voice
+            # Narrator fallback
             if "narrator" not in self.voice_map:
-                narrator_brief = "A calm, neutral, professional narrator voice, clear articulation, moderate pace, suitable for storytelling."
-                narrator_voice = self.voice_manager.map_character_to_voice(
-                    "narrator",
-                    narrator_brief
-                )
-                if narrator_voice:
-                    self.voice_map["narrator"] = narrator_voice
-            
-            # Save analysis to cache for future use
-            self.analysis_cache.save_analysis(
-                self.pdf_path,
-                self.metadata,
-                self.chapters,
-                self.character_registry,
-                self.voice_map
-            )
-            
-            self._update_progress(0.8, f"✅ Mapped {len(self.voice_map)} character voices")
+                self.voice_map["narrator"] = self.voice_manager.map_character_to_voice("narrator", "A neutral professional narrator.")
+                
+            self._update_progress(0.8, f"✅ Ready with {len(self.voice_map)} voices")
             return True
             
         except Exception as e:
-            print(f"❌ Error analyzing characters: {e}")
+            print(f"❌ Selection analysis failed: {e}")
             return False
+
+    def analyze_characters(self) -> bool:
+        """Deprecated: Favor analyze_characters_for_selection"""
+        if self.chapters:
+             # Analyze first 3 chapters as a preview if needed
+             return self.analyze_characters_for_selection([1, 2, 3])
+        return False
     
     def generate_chapter(self, 
                         chapter_index: int) -> Optional[str]:
@@ -212,20 +197,9 @@ class AudiobookOrchestrator:
             
             scene_file = self.output_dir / f"chapter_{chapter_num:02d}_scene_{i+1:02d}.wav"
             
-            # Add emotion modulation for each dialogue turn
-            for turn in scene.get('dialogue_turns', []):
-                speaker = turn.get('speaker')
-                emotion = turn.get('emotion', 'neutral')
-                
-                if speaker in self.character_registry:
-                    # Get emotion modulation parameters
-                    context = f"{turn.get('context_before', '')} {turn.get('text', '')}"
-                    modulation = self.character_designer.get_emotion_modulation(
-                        speaker,
-                        emotion,
-                        context
-                    )
-                    turn['emotion_params'] = modulation
+            # NOTE: Emotion modulation is handled directly by the voice_manager
+            # based on the 'emotion' field already present in each dialogue turn.
+            # We no longer make a separate LLM API call per turn (huge speed-up).
             
             # Generate audio with Kokoro
             success = self.voice_manager.generate_dialogue_scene(

@@ -20,17 +20,23 @@ class StoryDirector:
         self.chapters = []
         
     def extract_text_from_pdf(self, pdf_path: str) -> str:
-        """Extract text with structure preservation"""
+        """Extract text and metadata using PyMuPDF"""
         print(f"📄 Extracting text from PDF: {pdf_path}")
-        doc = fitz.open(pdf_path)
+        self.doc = fitz.open(pdf_path)
         full_text = ""
+        self.page_offsets = [0] # character offset where each page starts
         
-        for page_num in range(len(doc)):
-            page = doc[page_num]
-            full_text += page.get_text() + "\n\n"
+        # Also store TOC if available
+        self.internal_toc = self.doc.get_toc()
+        
+        for page_num in range(len(self.doc)):
+            page = self.doc[page_num]
+            text = page.get_text() + "\n\n"
+            full_text += text
+            self.page_offsets.append(len(full_text))
         
         self.full_text = full_text
-        print(f"✅ Extracted {len(full_text)} characters")
+        print(f"✅ Extracted {len(full_text)} characters from {len(self.doc)} pages")
         return full_text
     
     def extract_book_metadata(self) -> Dict:
@@ -69,34 +75,158 @@ class StoryDirector:
             return self.metadata
     
     def detect_chapters(self) -> List[Dict]:
-        """Detect chapter boundaries using Table of Contents first, then regex/AI"""
+        """Detect chapter boundaries using multiple strategies"""
         print("📑 Detecting chapters...")
-        
-        # First, try to extract chapters from Table of Contents
+
+        # 1. Try Internal PDF TOC first
+        chapters = self._get_chapters_from_internal_toc()
+        if chapters and len(chapters) > 3:
+            print(f"✅ Found {len(chapters)} chapters from Internal TOC")
+            self.chapters = self._populate_chapter_content(chapters)
+            return self.chapters
+
+        # 2. Try Manual TOC Analysis (Text parsing)
         chapters = self._extract_chapters_from_toc()
-        
-        if chapters and len(chapters) > 5:
-            print(f"✅ Found {len(chapters)} chapters from Table of Contents")
-            self.chapters = chapters
-            return chapters
-        
-        print("⚠️ Table of Contents extraction didn't find enough chapters, trying pattern matching...")
-        
-        # Fallback: use regex-based detection for simple number markers
+        if chapters and len(chapters) > 3:
+            print(f"✅ Found {len(chapters)} chapters from manual TOC analysis")
+            self.chapters = self._populate_chapter_content(chapters)
+            return self.chapters
+
+        # 3. Font-size based detection (Look for large headings)
+        chapters = self._detect_chapters_by_font_size()
+        if chapters and len(chapters) > 3:
+            print(f"✅ Found {len(chapters)} chapters from font-size analysis")
+            self.chapters = self._populate_chapter_content(chapters)
+            return self.chapters
+
+        # 4. Fallback: Sequential pattern matching
         chapters = self._detect_chapters_by_page_numbers()
-        
-        if chapters and len(chapters) > 5:
-            print(f"✅ Found {len(chapters)} chapters from page numbers")
-            self.chapters = chapters
-            return chapters
-        
-        # Final fallback: use AI detection
-        print("⚠️ Pattern matching found too few chapters, using AI detection...")
-        chapters = self._ai_chapter_detection()
-        
-        self.chapters = chapters
-        print(f"✅ Found {len(chapters)} chapters")
+        self.chapters = self._populate_chapter_content(chapters)
+        print(f"✅ Found {len(self.chapters)} chapters via fallback")
+        return self.chapters
+
+    def _get_chapters_from_internal_toc(self) -> List[Dict]:
+        """Convert PDF's internal TOC structure to our chapter format"""
+        if not self.internal_toc:
+            return []
+            
+        chapters = []
+        for level, title, page in self.internal_toc:
+            if level == 1 or "chapter" in title.lower():
+                chapters.append({
+                    "number": len(chapters) + 1,
+                    "title": title,
+                    "page_start": page,
+                    "content": ""
+                })
         return chapters
+
+    def _detect_chapters_by_font_size(self) -> List[Dict]:
+        """Scan for text with unusually large font size compared to body text"""
+        print("🔍 Analyzing font sizes for chapter headers...")
+        
+        font_data = []
+        for page_num in range(min(50, len(self.doc))): # Scan first 50 pages
+            page = self.doc[page_num]
+            blocks = page.get_text("dict")["blocks"]
+            for b in blocks:
+                if "lines" in b:
+                    for l in b["lines"]:
+                        for s in l["spans"]:
+                            font_data.append(s["size"])
+        
+        if not font_data: return []
+        
+        # Calculate median font size (body text)
+        median_size = sorted(font_data)[len(font_data)//2]
+        header_threshold = median_size * 1.5 # Headers are usually 50%+ larger
+        
+        chapters = []
+        noise_keywords = ["copyright", "contents", "dedication", "preface", "about the author", "title page"]
+        
+        for page_num in range(len(self.doc)):
+            page = self.doc[page_num]
+            blocks = page.get_text("dict")["blocks"]
+            for b in blocks:
+                if "lines" in b:
+                    full_block_text = " ".join([" ".join([s["text"] for s in l["spans"]]) for l in b["lines"]]).strip()
+                    if not full_block_text: continue
+                    
+                    # Check if any span in the block is header-sized
+                    is_header = any(any(s["size"] > header_threshold for s in l["spans"]) for l in b["lines"])
+                    
+                    if is_header and len(full_block_text) < 100:
+                        # Filter noise
+                        if any(kw in full_block_text.lower() for kw in noise_keywords):
+                            continue
+                            
+                        # Avoid duplicates on same page
+                        if chapters and chapters[-1]["page_start"] == page_num + 1:
+                            continue
+                            
+                        chapters.append({
+                            "number": len(chapters) + 1,
+                            "title": full_block_text,
+                            "page_start": page_num + 1,
+                            "content": ""
+                        })
+        return chapters
+
+    def _populate_chapter_content(self, chapters: List[Dict]) -> List[Dict]:
+        """Extract actual text content for each chapter from full_text."""
+        if not chapters or not self.full_text:
+            return chapters
+
+        # Sort by page_start if available, else by number
+        chapters = sorted(chapters, key=lambda c: (c.get('page_start', 0), c.get('number', 0)))
+        total_len = len(self.full_text)
+        start_positions = []
+
+        for ch in chapters:
+            num = ch.get('number', 0)
+            title = ch.get('title', '').strip()
+            page_start = ch.get('page_start', 0)
+            
+            # Strategy 1: If we have a page number, use the character offset for that page
+            if page_start > 0 and page_start <= len(self.page_offsets):
+                start_positions.append(self.page_offsets[page_start - 1])
+                continue
+
+            # Strategy 2: Regex search (only if page number is missing)
+            title_esc = re.escape(title)
+            pos = -1
+            patterns = [
+                rf'(?mi)^\s*chapter\s+{num}\b',
+                rf'(?mi)^\s*{title_esc}\b',
+                rf'(?m)^\s*{num}\s*$',
+            ]
+            
+            for pattern in patterns:
+                m = re.search(pattern, self.full_text)
+                if m:
+                    pos = m.start()
+                    break
+            start_positions.append(pos)
+
+        # Fill in any failed searches
+        for i in range(len(start_positions)):
+            if start_positions[i] < 0:
+                prev = next((start_positions[j] for j in range(i - 1, -1, -1) if start_positions[j] >= 0), 0)
+                nxt = next((start_positions[j] for j in range(i + 1, len(start_positions)) if start_positions[j] >= 0), total_len)
+                start_positions[i] = (prev + nxt) // 2
+
+        # Slice content
+        for i, ch in enumerate(chapters):
+            s = start_positions[i]
+            e = start_positions[i + 1] if i + 1 < len(start_positions) else total_len
+            
+            # Trim the title from the start of the content to avoid repetition in audio
+            content = self.full_text[s:e].strip()
+            # Basic sanity check: if content starts with title, skip it
+            # (We'll let the narrator handle titles if needed)
+            chapters[i]['content'] = content
+
+        return sorted(chapters, key=lambda c: c.get('number', 0))
     
     def _extract_chapters_from_toc(self) -> List[Dict]:
         """Extract chapters from Table of Contents"""
@@ -182,41 +312,40 @@ class StoryDirector:
         return chapters if len(chapters) > 0 else []
     
     def _detect_chapters_by_page_numbers(self) -> List[Dict]:
-        """Detect chapters by finding simple number markers at start of lines"""
+        """Detect chapters by finding strictly sequential standalone numbers"""
         print("🔢 Detecting chapter numbers in text...")
         
         lines = self.full_text.split('\n')
         chapters = []
-        
-        # Look for standalone numbers (1, 2, 3, etc)
         expected_chapter_num = 1
         
         for i, line in enumerate(lines):
             line_stripped = line.strip()
-            
-            # Check if line is just a number
+
+            # Standalone digits, strictly sequential
             if line_stripped.isdigit():
                 chapter_num = int(line_stripped)
-                
-                # Accept if it matches expected sequence or if it's a reasonable chapter number
-                if chapter_num == expected_chapter_num or chapter_num < 200:
-                    # Get next non-empty line as potential title
+
+                if chapter_num == expected_chapter_num:
+                    # Look ahead for a title
                     chapter_title = f"Chapter {chapter_num}"
                     for j in range(i + 1, min(i + 5, len(lines))):
                         next_line = lines[j].strip()
-                        if next_line and len(next_line) < 100:
-                            chapter_title = next_line
-                            break
-                    
+                        if next_line and 3 < len(next_line) < 60 and not next_line.isdigit():
+                            # Filter out common noise
+                            if not any(kw in next_line.lower() for kw in ["copyright", "dedicated", "contents"]):
+                                chapter_title = next_line
+                                break
+
                     chapters.append({
                         "number": chapter_num,
                         "title": chapter_title,
                         "content": "",
+                        "page_start": 0 # Unknown
                     })
-                    
                     expected_chapter_num = chapter_num + 1
         
-        return chapters if len(chapters) > 5 else []
+        return chapters if len(chapters) > 2 else []
     
     def _ai_chapter_detection(self) -> List[Dict]:
         """Use AI to detect chapters when regex fails"""
